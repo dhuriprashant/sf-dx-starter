@@ -198,7 +198,24 @@ public with sharing class JsonApiService {
         Map<String, Map<Id, List<Map<String, Object>>>> toManyData = new Map<String, Map<Id, List<Map<String, Object>>>>();
     }
 
-    /** Resolve ?include: fetch related records, build the included array and to-many linkage. */
+    /** One expanded level of an include path: the records reached and their definition. */
+    private class Level {
+        JsonApiResourceDefinition def;
+        List<SObject> records = new List<SObject>();
+    }
+
+    private class PendingInclude {
+        SObject rec;
+        JsonApiResourceDefinition def;
+    }
+
+    /**
+     * Resolve ?include (relationship names or dot-paths): fetch related records
+     * level by level, build the included array and relationship linkage.
+     * Per the spec, dot-paths include the intermediate resources along with the
+     * leaf nodes, and serialization is deferred until all linkage is known so
+     * included intermediates carry full linkage for the next path segment.
+     */
     private static Compound buildCompound(
         List<SObject> records,
         JsonApiResourceDefinition def,
@@ -209,45 +226,93 @@ public with sharing class JsonApiService {
             return comp;
         }
         Set<String> seen = new Set<String>();
-        for (String relName : qp.include) {
-            JsonApiResourceDefinition.Rel rel = def.relationships.get(relName);
-            if (rel.isNested()) {
-                NestedResult nr = traverseNested(def, rel, records);
-                for (SObject fin : nr.finalsById.values()) {
-                    addIncluded(comp, seen, fin, nr.finalDef, qp);
-                }
-                comp.toManyData.put(relName, nr.linkage);
-                continue;
-            }
-            JsonApiResourceDefinition targetDef = JsonApiRegistry.get(rel.targetType);
-            if (rel.isToMany) {
-                Set<Id> parentIds = new Map<Id, SObject>(records).keySet();
-                Map<Id, List<Map<String, Object>>> linkage = new Map<Id, List<Map<String, Object>>>();
-                for (SObject child : queryChildren(targetDef, rel.field, parentIds)) {
-                    Id parentId = (Id) child.get(rel.field);
-                    if (!linkage.containsKey(parentId)) {
-                        linkage.put(parentId, new List<Map<String, Object>>());
-                    }
-                    linkage.get(parentId).add(JsonApiSerializer.identifier(rel.targetType, child.Id));
-                    addIncluded(comp, seen, child, targetDef, qp);
-                }
-                comp.toManyData.put(relName, linkage);
-            } else {
-                Set<Id> targetIds = new Set<Id>();
-                for (SObject rec : records) {
-                    Id targetId = (Id) rec.get(rel.field);
-                    if (targetId != null) {
-                        targetIds.add(targetId);
+        for (SObject rec : records) {
+            seen.add(def.resourceType + ':' + rec.Id); // primary data must not be duplicated in included
+        }
+        List<PendingInclude> pending = new List<PendingInclude>();
+        Map<String, Level> levelCache = new Map<String, Level>(); // path prefix -> expanded level
+
+        for (String includePath : qp.include) {
+            Level current = new Level();
+            current.def = def;
+            current.records = records;
+            String prefix = '';
+            for (String segName : includePath.split('\\.')) {
+                prefix = prefix == '' ? segName : prefix + '.' + segName;
+                if (levelCache.containsKey(prefix)) {
+                    current = levelCache.get(prefix);
+                } else {
+                    current = expandRelationship(comp, current, segName);
+                    levelCache.put(prefix, current);
+                    for (SObject rec : current.records) {
+                        String key = current.def.resourceType + ':' + rec.Id;
+                        if (!seen.contains(key)) {
+                            seen.add(key);
+                            PendingInclude pi = new PendingInclude();
+                            pi.rec = rec;
+                            pi.def = current.def;
+                            pending.add(pi);
+                        }
                     }
                 }
-                if (!targetIds.isEmpty()) {
-                    for (SObject target : queryByIds(targetDef, targetIds)) {
-                        addIncluded(comp, seen, target, targetDef, qp);
-                    }
+                if (current.records.isEmpty()) {
+                    break;
                 }
             }
         }
+
+        for (PendingInclude pi : pending) {
+            comp.included.add(JsonApiSerializer.resource(pi.rec, pi.def, qp, comp.toManyData));
+        }
         return comp;
+    }
+
+    /** Fetch one relationship level for the given parents and merge its linkage into the compound. */
+    private static Level expandRelationship(Compound comp, Level parents, String relName) {
+        JsonApiResourceDefinition.Rel rel = parents.def.relationships.get(relName);
+        Level next = new Level();
+        if (rel.isNested()) {
+            NestedResult nr = traverseNested(parents.def, rel, parents.records);
+            next.def = nr.finalDef;
+            next.records = nr.finalsById.values();
+            mergeLinkage(comp, rel.name, nr.linkage);
+            return next;
+        }
+        JsonApiResourceDefinition targetDef = JsonApiRegistry.get(rel.targetType);
+        next.def = targetDef;
+        if (rel.isToMany) {
+            Set<Id> parentIds = new Map<Id, SObject>(parents.records).keySet();
+            Map<Id, List<Map<String, Object>>> linkage = new Map<Id, List<Map<String, Object>>>();
+            for (SObject child : queryChildren(targetDef, rel.field, parentIds)) {
+                Id parentId = (Id) child.get(rel.field);
+                if (!linkage.containsKey(parentId)) {
+                    linkage.put(parentId, new List<Map<String, Object>>());
+                }
+                linkage.get(parentId).add(JsonApiSerializer.identifier(rel.targetType, child.Id));
+                next.records.add(child);
+            }
+            mergeLinkage(comp, rel.name, linkage);
+        } else {
+            // to-one linkage is read straight off the parent record at serialization time
+            Set<Id> targetIds = new Set<Id>();
+            for (SObject rec : parents.records) {
+                Id targetId = (Id) rec.get(rel.field);
+                if (targetId != null) {
+                    targetIds.add(targetId);
+                }
+            }
+            if (!targetIds.isEmpty()) {
+                next.records = queryByIds(targetDef, targetIds);
+            }
+        }
+        return next;
+    }
+
+    private static void mergeLinkage(Compound comp, String relName, Map<Id, List<Map<String, Object>>> linkage) {
+        if (!comp.toManyData.containsKey(relName)) {
+            comp.toManyData.put(relName, new Map<Id, List<Map<String, Object>>>());
+        }
+        comp.toManyData.get(relName).putAll(linkage);
     }
 
     private class NestedResult {
@@ -255,33 +320,6 @@ public with sharing class JsonApiService {
         Map<Id, SObject> finalsById = new Map<Id, SObject>();
         /** root record Id -> resource identifiers of the final-hop records it reaches (deduplicated) */
         Map<Id, List<Map<String, Object>>> linkage = new Map<Id, List<Map<String, Object>>>();
-    }
-
-    /**
-     * Validate a nested relationship's path against the registry and cache the
-     * resolved cardinality/target on the Rel (to-many if any hop is to-many).
-     */
-    private static void resolveNested(JsonApiResourceDefinition def, JsonApiResourceDefinition.Rel rel) {
-        if (rel.targetType != null) {
-            return;
-        }
-        JsonApiResourceDefinition currentDef = def;
-        Boolean toMany = false;
-        for (String hopName : rel.path) {
-            JsonApiResourceDefinition.Rel hop = currentDef.relationships.get(hopName);
-            if (hop == null || hop.isNested()) {
-                throw JsonApiException.of(
-                    500,
-                    'Configuration Error',
-                    'Nested relationship "' + rel.name + '" on ' + def.resourceType +
-                        ' requires a direct relationship "' + hopName + '" on ' + currentDef.resourceType + '.'
-                );
-            }
-            toMany = toMany || hop.isToMany;
-            currentDef = JsonApiRegistry.get(hop.targetType);
-        }
-        rel.isToMany = toMany;
-        rel.targetType = currentDef.resourceType;
     }
 
     /**
@@ -294,7 +332,7 @@ public with sharing class JsonApiService {
         JsonApiResourceDefinition.Rel rel,
         List<SObject> roots
     ) {
-        resolveNested(def, rel);
+        JsonApiRegistry.resolveNested(def, rel);
         JsonApiResourceDefinition currentDef = def;
         Map<Id, SObject> current = new Map<Id, SObject>(roots);
         Map<Id, Set<Id>> rootsOf = new Map<Id, Set<Id>>(); // current record Id -> root Ids that reach it
@@ -354,21 +392,6 @@ public with sharing class JsonApiService {
             }
         }
         return result;
-    }
-
-    private static void addIncluded(
-        Compound comp,
-        Set<String> seen,
-        SObject rec,
-        JsonApiResourceDefinition def,
-        JsonApiQueryParams qp
-    ) {
-        String key = def.resourceType + ':' + rec.Id;
-        if (seen.contains(key)) {
-            return;
-        }
-        seen.add(key);
-        comp.included.add(JsonApiSerializer.resource(rec, def, qp, null));
     }
 
     private static SObject fetchById(JsonApiResourceDefinition def, Id recordId) {

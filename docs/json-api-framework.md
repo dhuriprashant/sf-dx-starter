@@ -22,7 +22,7 @@ https://<my-domain>.my.salesforce.com/services/apexrest/jsonapi
 
 ## Supported query parameters
 
-- `include=contacts` — compound documents; related resources land in `included`, and to-many linkage appears under `relationships.{rel}.data`. Dot-paths (`include=contacts.reportsTo`) are not supported; instead a nested path can be registered under a direct alias (e.g. `contactManagers`) per the [spec's alternative-name provision](https://jsonapi.org/format/#fetching-includes) — `include=contactManagers` then returns the final-hop resources without the intermediate ones.
+- `include=contacts` — compound documents; related resources land in `included`, and to-many linkage appears under `relationships.{rel}.data`. Dot-paths are supported (`include=contacts.reportsTo`): per the spec, intermediate resources are included along with the leaf nodes, with full linkage on each level. To get only the leaf resources without the intermediates, a nested path can also be registered under a direct alias (e.g. `contactManagers`) per the [spec's alternative-name provision](https://jsonapi.org/format/#fetching-includes) — `include=contactManagers` then returns just the managers.
 - `fields[accounts]=name,industry` — sparse fieldsets per resource type.
 - `sort=-name,createdAt` — `-` prefix means descending. Attributes must be exposed on the resource.
 - `page[number]=2&page[size]=20` — offset pagination (max size 200). Responses carry `first`/`prev`/`next`/`last` links and `meta.totalResources`.

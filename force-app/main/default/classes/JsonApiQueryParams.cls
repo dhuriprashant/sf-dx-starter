@@ -24,11 +24,21 @@ public class JsonApiQueryParams {
             String value = params.get(key);
             if (key == 'include') {
                 for (String inc : value.split(',')) {
-                    String name = inc.trim();
-                    if (!def.relationships.containsKey(name)) {
-                        throw JsonApiException.badParameter('Unknown relationship in include: ' + name, 'include');
+                    String path = inc.trim();
+                    // dot-paths: each segment must be a relationship on the type reached by the previous one
+                    JsonApiResourceDefinition currentDef = def;
+                    for (String seg : path.split('\\.')) {
+                        JsonApiResourceDefinition.Rel rel = currentDef.relationships.get(seg);
+                        if (rel == null) {
+                            throw JsonApiException.badParameter(
+                                'Unknown relationship "' + seg + '" in include path: ' + path,
+                                'include'
+                            );
+                        }
+                        JsonApiRegistry.resolveNested(currentDef, rel);
+                        currentDef = JsonApiRegistry.get(rel.targetType);
                     }
-                    qp.include.add(name);
+                    qp.include.add(path);
                 }
             } else if (key.startsWith('fields[') && key.endsWith(']')) {
                 String resType = key.substring(7, key.length() - 1);

@@ -224,6 +224,61 @@ private class JsonApiRouterTest {
     }
 
     @IsTest
+    static void includesDotPathWithIntermediates() {
+        Account acc = makeAccount('Acme');
+        insert acc;
+        Contact manager = new Contact(LastName = 'Manager');
+        insert manager;
+        Contact report = new Contact(LastName = 'Report', AccountId = acc.Id, ReportsToId = manager.Id);
+        insert report;
+
+        RestResponse res = invoke('GET', '/accounts/' + acc.Id, null, new Map<String, String>{
+            'include' => 'contacts.reportsTo'
+        });
+
+        Assert.areEqual(200, res.statusCode);
+        Map<String, Object> doc = parse(res);
+        List<Object> included = (List<Object>) doc.get('included');
+        Assert.areEqual(2, included.size(), 'intermediate contact and leaf manager should both be included');
+        Set<String> includedIds = new Set<String>();
+        for (Object o : included) {
+            Map<String, Object> resc = (Map<String, Object>) o;
+            includedIds.add((String) resc.get('id'));
+            if (resc.get('id') == String.valueOf(report.Id)) {
+                // full linkage: the intermediate contact links to its manager
+                Map<String, Object> rels = (Map<String, Object>) resc.get('relationships');
+                Map<String, Object> linkage = (Map<String, Object>) ((Map<String, Object>) rels.get('reportsTo')).get('data');
+                Assert.areEqual(String.valueOf(manager.Id), linkage.get('id'));
+            }
+        }
+        Assert.isTrue(includedIds.contains(String.valueOf(report.Id)));
+        Assert.isTrue(includedIds.contains(String.valueOf(manager.Id)));
+    }
+
+    @IsTest
+    static void dotPathEmitsToManyLinkageOnIncludedIntermediates() {
+        Account acc = makeAccount('Acme');
+        insert acc;
+        Contact con = new Contact(LastName = 'One', AccountId = acc.Id);
+        insert con;
+
+        RestResponse res = invoke('GET', '/contacts/' + con.Id, null, new Map<String, String>{
+            'include' => 'account.contacts'
+        });
+
+        Assert.areEqual(200, res.statusCode);
+        Map<String, Object> doc = parse(res);
+        List<Object> included = (List<Object>) doc.get('included');
+        Assert.areEqual(1, included.size(), 'the account is included; the primary contact must not be duplicated');
+        Map<String, Object> accRes = (Map<String, Object>) included[0];
+        Assert.areEqual(String.valueOf(acc.Id), accRes.get('id'));
+        Map<String, Object> rels = (Map<String, Object>) accRes.get('relationships');
+        List<Object> linkage = (List<Object>) ((Map<String, Object>) rels.get('contacts')).get('data');
+        Assert.areEqual(1, linkage.size(), 'included account should carry full to-many linkage');
+        Assert.areEqual(String.valueOf(con.Id), ((Map<String, Object>) linkage[0]).get('id'));
+    }
+
+    @IsTest
     static void returnsJsonApiErrors() {
         RestResponse res = invoke('GET', '/widgets', null, null);
         Assert.areEqual(404, res.statusCode);
@@ -232,6 +287,9 @@ private class JsonApiRouterTest {
 
         res = invoke('GET', '/accounts', null, new Map<String, String>{ 'include' => 'nope' });
         Assert.areEqual(400, res.statusCode);
+
+        res = invoke('GET', '/accounts', null, new Map<String, String>{ 'include' => 'contacts.nope' });
+        Assert.areEqual(400, res.statusCode, 'unknown segment inside a dot-path should be rejected');
 
         Account acc = makeAccount('Acme');
         insert acc;

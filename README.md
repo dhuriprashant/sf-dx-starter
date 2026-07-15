@@ -1,8 +1,24 @@
-# Salesforce DX Project
+# Salesforce DX Starter
+
+A Salesforce DX project (API v67.0) containing a custom **JSON:API framework** for Apex REST, plus reference docs on platform integration patterns.
+
+## What's in this repo
+
+### JSON:API Framework
+
+A generic Apex REST framework that serves registered SObjects per the [JSON:API v1.1 specification](https://jsonapi.org/format/) from `/services/apexrest/jsonapi`. It supports CRUD, compound documents (`?include` with dot-paths and aliased nested relationship paths), sparse fieldsets, sorting, filtering, and offset pagination — all enforced with `USER_MODE` security. Source: the `JsonApi*` classes in [force-app/main/default/classes/](force-app/main/default/classes/).
+
+- **[docs/json-api-framework.md](docs/json-api-framework.md)** — API reference: endpoints, query parameters, how to expose a new SObject, curl examples.
+- **[docs/json-api-framework-internals.md](docs/json-api-framework-internals.md)** — technical internals: component map, request lifecycle, SOQL construction, compound-document algorithm, error and security model.
+
+### Reference docs
+
+- **[event-publishing.md](event-publishing.md)** — Salesforce change notification options (CDC, Platform Events, outbound messaging, etc.) for notifying consumer apps of record changes.
+- **[callout-readme.md](callout-readme.md)** — Apex callouts reference: DML + callout restrictions, async patterns, passing new record IDs in payloads.
+
+## About Salesforce DX
 
 Salesforce DX is a development approach that brings source-driven development, team collaboration, and continuous integration to the Salesforce Platform. Instead of working directly in an org through a web browser, you work with metadata as source files in a local DX project, track changes in version control, and deploy through automated processes.
-
-This project template gets you started with the tools and structure you need to build Salesforce applications using source control, scratch orgs, and the Salesforce CLI.
 
 ## Prerequisites
 
@@ -42,6 +58,24 @@ Here are common CLI commands that you'll use the most:
 - `sf data <command>`: Work with test data
 - `sf alias <command>`: Manage org aliases
 - `sf config <command>`: Configure CLI settings
+
+## Local Development & Quality
+
+```bash
+npm run lint                 # ESLint for Aura and LWC JS
+npm run test:unit            # LWC Jest unit tests
+npm run prettier             # Format all source files
+npm run prettier:verify      # Check formatting without writing
+```
+
+A pre-commit hook (husky + lint-staged) runs Prettier, ESLint, and related Jest tests on staged files automatically.
+
+Deploy and test the JSON:API framework:
+
+```bash
+sf project deploy start --source-dir force-app/main/default/classes
+sf apex run test --class-names JsonApiRouterTest --result-format human --wait 10
+```
 
 ## Use Agentforce Vibes to Build Lightning Apps
 
