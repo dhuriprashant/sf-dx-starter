@@ -167,6 +167,63 @@ private class JsonApiRouterTest {
     }
 
     @IsTest
+    static void includesNestedRelationshipWithoutIntermediates() {
+        Account acc = makeAccount('Acme');
+        Account other = makeAccount('Globex');
+        insert new List<Account>{ acc, other };
+        Contact manager = new Contact(LastName = 'Manager', AccountId = other.Id);
+        insert manager;
+        insert new List<Contact>{
+            new Contact(LastName = 'ReportOne', AccountId = acc.Id, ReportsToId = manager.Id),
+            new Contact(LastName = 'ReportTwo', AccountId = acc.Id, ReportsToId = manager.Id)
+        };
+
+        RestResponse res = invoke('GET', '/accounts/' + acc.Id, null, new Map<String, String>{
+            'include' => 'contactManagers'
+        });
+
+        Assert.areEqual(200, res.statusCode);
+        Map<String, Object> doc = parse(res);
+        List<Object> included = (List<Object>) doc.get('included');
+        Assert.areEqual(1, included.size(), 'only the final-hop manager should be included, not the intermediate contacts');
+        Map<String, Object> managerRes = (Map<String, Object>) included[0];
+        Assert.areEqual(String.valueOf(manager.Id), managerRes.get('id'));
+        Assert.areEqual('Manager', ((Map<String, Object>) managerRes.get('attributes')).get('lastName'));
+
+        Map<String, Object> data = (Map<String, Object>) doc.get('data');
+        Map<String, Object> rels = (Map<String, Object>) data.get('relationships');
+        Map<String, Object> nestedRel = (Map<String, Object>) rels.get('contactManagers');
+        List<Object> linkage = (List<Object>) nestedRel.get('data');
+        Assert.areEqual(1, linkage.size(), 'the shared manager should be linked once');
+        Assert.areEqual(String.valueOf(manager.Id), ((Map<String, Object>) linkage[0]).get('id'));
+    }
+
+    @IsTest
+    static void servesNestedRelationshipEndpoints() {
+        Account acc = makeAccount('Acme');
+        insert acc;
+        Contact manager = new Contact(LastName = 'Manager');
+        insert manager;
+        insert new Contact(LastName = 'Report', AccountId = acc.Id, ReportsToId = manager.Id);
+
+        RestResponse res = invoke('GET', '/accounts/' + acc.Id + '/contactManagers', null, null);
+        Assert.areEqual(200, res.statusCode);
+        List<Object> related = (List<Object>) parse(res).get('data');
+        Assert.areEqual(1, related.size());
+        Assert.areEqual(String.valueOf(manager.Id), ((Map<String, Object>) related[0]).get('id'));
+
+        res = invoke('GET', '/accounts/' + acc.Id + '/relationships/contactManagers', null, null);
+        Assert.areEqual(200, res.statusCode);
+        List<Object> linkage = (List<Object>) parse(res).get('data');
+        Assert.areEqual(1, linkage.size());
+        Assert.areEqual('contacts', ((Map<String, Object>) linkage[0]).get('type'));
+
+        String body = JSON.serialize(new Map<String, Object>{ 'data' => null });
+        res = invoke('PATCH', '/accounts/' + acc.Id + '/relationships/contactManagers', body, null);
+        Assert.areEqual(403, res.statusCode, 'nested relationships are read-only');
+    }
+
+    @IsTest
     static void returnsJsonApiErrors() {
         RestResponse res = invoke('GET', '/widgets', null, null);
         Assert.areEqual(404, res.statusCode);

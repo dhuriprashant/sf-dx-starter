@@ -20,6 +20,9 @@ public class JsonApiConfig {
                 .attribute('numberOfEmployees', 'NumberOfEmployees')
                 .attribute('createdAt', 'CreatedDate')
                 .toMany('contacts', 'contacts', 'AccountId')
+                // contacts.reportsTo exposed as a direct alias: include=contactManagers
+                // returns the managers without including the intermediate contacts
+                .nested('contactManagers', new List<String>{ 'contacts', 'reportsTo' })
         );
 
         JsonApiRegistry.register(
@@ -31,6 +34,7 @@ public class JsonApiConfig {
                 .attribute('title', 'Title')
                 .attribute('createdAt', 'CreatedDate')
                 .toOne('account', 'AccountId', 'accounts')
+                .toOne('reportsTo', 'ReportsToId', 'contacts')
         );
     }
 

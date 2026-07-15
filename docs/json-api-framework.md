@@ -22,7 +22,7 @@ https://<my-domain>.my.salesforce.com/services/apexrest/jsonapi
 
 ## Supported query parameters
 
-- `include=contacts` — compound documents; related resources land in `included`, and to-many linkage appears under `relationships.{rel}.data`. One level deep.
+- `include=contacts` — compound documents; related resources land in `included`, and to-many linkage appears under `relationships.{rel}.data`. Dot-paths (`include=contacts.reportsTo`) are not supported; instead a nested path can be registered under a direct alias (e.g. `contactManagers`) per the [spec's alternative-name provision](https://jsonapi.org/format/#fetching-includes) — `include=contactManagers` then returns the final-hop resources without the intermediate ones.
 - `fields[accounts]=name,industry` — sparse fieldsets per resource type.
 - `sort=-name,createdAt` — `-` prefix means descending. Attributes must be exposed on the resource.
 - `page[number]=2&page[size]=20` — offset pagination (max size 200). Responses carry `first`/`prev`/`next`/`last` links and `meta.totalResources`.
@@ -45,7 +45,11 @@ JsonApiRegistry.register(
 );
 // and on the parent side:
 // .toMany('opportunities', 'opportunities', 'AccountId')  // FK field on the child
+// alias a nested path (each segment a direct relationship on the previous type):
+// .nested('opportunityAccounts', new List<String>{ 'opportunities', 'account' })
 ```
+
+Nested relationships are read-only: they can be `include`d and served from `/{type}/{id}/{rel}` and `/{type}/{id}/relationships/{rel}`, but PATCHing them returns 403.
 
 Only attributes you list are readable/writable through the API — everything else is rejected with a 400 and a JSON:API source pointer.
 

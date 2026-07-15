@@ -43,12 +43,21 @@ public class JsonApiSerializer {
                     'related' => resourceUrl(def.resourceType, rec.Id) + '/' + relName
                 }
             };
-            if (!rel.isToMany) {
+            if (!rel.isNested() && !rel.isToMany) {
                 Id targetId = (Id) rec.get(rel.field);
                 relObj.put('data', targetId == null ? null : identifier(rel.targetType, targetId));
             } else if (toManyData != null && toManyData.containsKey(relName)) {
+                // direct to-many, or nested (linkage computed only when ?include'd)
                 List<Map<String, Object>> linkage = toManyData.get(relName).get(rec.Id);
-                relObj.put('data', linkage == null ? new List<Map<String, Object>>() : linkage);
+                if (linkage == null) {
+                    linkage = new List<Map<String, Object>>();
+                }
+                if (rel.isToMany == true) {
+                    relObj.put('data', linkage);
+                } else {
+                    // nested path of only to-one hops resolves to to-one linkage
+                    relObj.put('data', linkage.isEmpty() ? null : linkage[0]);
+                }
             }
             rels.put(relName, relObj);
         }
