@@ -51,9 +51,28 @@ private class JsonApiRouterTest {
         Assert.areEqual('accounts', first.get('type'));
         Assert.areEqual('Charlie', ((Map<String, Object>) first.get('attributes')).get('name'));
         Map<String, Object> meta = (Map<String, Object>) doc.get('meta');
-        Assert.areEqual(3, meta.get('totalResources'));
+        Assert.isFalse(meta.containsKey('totalResources'), 'paginated responses carry no totals');
+        Assert.areEqual(2, meta.get('pageSize'));
         Map<String, Object> links = (Map<String, Object>) doc.get('links');
         Assert.isTrue(links.containsKey('next'), 'next link expected on page 1 of 2');
+        Assert.isFalse(links.containsKey('last'), 'last link requires a total');
+    }
+
+    @IsTest
+    static void paginationStopsAtFinalPage() {
+        insert new List<Account>{ makeAccount('Alpha'), makeAccount('Bravo'), makeAccount('Charlie') };
+
+        RestResponse res = invoke('GET', '/accounts', null, new Map<String, String>{
+            'page[size]' => '2',
+            'page[number]' => '2'
+        });
+
+        Assert.areEqual(200, res.statusCode);
+        Map<String, Object> doc = parse(res);
+        Assert.areEqual(1, ((List<Object>) doc.get('data')).size(), 'final partial page');
+        Map<String, Object> links = (Map<String, Object>) doc.get('links');
+        Assert.isFalse(links.containsKey('next'), 'no next link on the final page');
+        Assert.isTrue(links.containsKey('prev'));
     }
 
     @IsTest

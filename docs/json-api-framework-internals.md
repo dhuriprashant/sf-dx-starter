@@ -197,11 +197,11 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 ([JsonApiService.cls:8-34](../force-app/main/default/classes/JsonApiService.cls#L8-L34))
 
 1. `buildWhere()` turns `qp.filters` into `WHERE Field0 IN :jsonApiFilter0 AND Field1 IN :jsonApiFilter1 ...`. Each raw value is comma-split and converted to a **typed list** by `typedFilterValues()` ([JsonApiService.cls:449-491](../force-app/main/default/classes/JsonApiService.cls#L449-L491)) — `List<Date>`, `List<Datetime>`, `List<Decimal>`, `List<Boolean>`, or `List<String>` depending on the field's describe type. This exists because SOQL rejects `List<Object>` binds ("Invalid bind expression type of ANY").
-2. For paginated requests, `Database.countQueryWithBinds` runs `SELECT COUNT()` with the same WHERE to get `totalResources` for pagination meta/links. Counted rows consume the 50k query-row governor budget, so the COUNT is capped with a `LIMIT` at the remaining budget (minus the page itself); hitting the cap throws a 400 "Result Set Too Large" instead of an uncatchable `LimitException`. Unpaginated requests skip the COUNT — the result itself is the total — and cap the data query the same way.
+2. No COUNT query is ever run. Paginated requests fetch `pageSize + 1` rows — the sentinel row's presence decides the `next` link — so a page costs only `pageSize + 1` of the 50k query-row governor budget regardless of collection size. Unpaginated requests fetch everything, capped with a `LIMIT` at the remaining budget; filling the cap is treated as truncation and throws a 400 "Result Set Too Large" instead of an uncatchable `LimitException` (`totalResources` is `records.size()`).
 3. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus, when `page[size]` was given, `LIMIT :jsonApiLimit OFFSET :jsonApiOffset` computed as `(pageNumber - 1) * pageSize`. Without `page[size]` the query is unpaginated.
-4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev/next/last, with `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`totalResources`, `pageNumber`, `pageSize`). Unpaginated requests get only a `self` link and `totalResources`.
+4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev, plus next when the sentinel row was present — no `last`, since there is no total; `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`pageNumber`, `pageSize`; no `totalResources`). Unpaginated requests get only a `self` link and `totalResources`.
 
-Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000 (`MAX_SOQL_OFFSET`), so a page starting beyond row 2000 is rejected up front with a 400 Invalid Query Parameter on `page[number]` — before the COUNT query spends any budget.
+Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000 (`MAX_SOQL_OFFSET`), so a page starting beyond row 2000 is rejected up front with a 400 Invalid Query Parameter on `page[number]` — before any query runs.
 
 ### 5.3 GET /{type}/{id} — getResource and fetchById
 
@@ -337,14 +337,13 @@ Authentication is standard Salesforce OAuth — Apex REST requires a valid sessi
 3. `pathSegments` → `['accounts']`; `JsonApiRegistry.get('accounts')` resolves the definition.
 4. `JsonApiQueryParams.parse`: `include=['contacts']` (validated against accounts' relationships), `sparseFields={'contacts': {'firstName'}}`, `sorts=[{name, desc}]`, `pageSize=2`.
 5. `listResources`:
-   - `SELECT COUNT() FROM Account` (no filters) → say 7.
-   - `SELECT Id, Name, Industry, Phone, Website, NumberOfEmployees, CreatedDate FROM Account ORDER BY Name DESC NULLS LAST LIMIT :2 OFFSET :0` (USER_MODE).
+   - `SELECT Id, Name, Industry, Phone, Website, NumberOfEmployees, CreatedDate FROM Account ORDER BY Name DESC NULLS LAST LIMIT :3 OFFSET :0` (USER_MODE) — `pageSize + 1`; the third (sentinel) row means there's a next page and is trimmed from the result.
    - `buildCompound`: one query `SELECT Id, FirstName, ..., AccountId FROM Contact WHERE AccountId IN :(2 account ids)`; children grouped per account into `toManyData['contacts']`; each contact serialized (sparse → only `firstName` attribute) into `included`.
    - Each account serialized with `relationships.contacts.data` = its identifier list.
-   - Document assembled with `links` (self/first/next/last) and `meta` `{totalResources: 7, pageNumber: 1, pageSize: 2}`.
+   - Document assembled with `links` (self/first/next) and `meta` `{pageNumber: 1, pageSize: 2}`.
 6. Router serializes the map, status 200.
 
-Total: **3 SOQL queries** for the whole request, independent of row counts.
+Total: **2 SOQL queries** for the whole request, independent of row counts.
 
 Variant with a dot-path — `GET /accounts/{id}?include=contacts.reportsTo`: after `fetchById` loads the account (1 query), `buildCompound` expands segment `contacts` (1 query) and segment `reportsTo` (1 query). Per the spec's full-linkage rule, `included` contains **both** the contacts and their managers, and each included contact carries its `reportsTo` linkage. Total: **3 queries**, generally `1 + pathLength`.
 
@@ -367,7 +366,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 
 ## 11. Tests & deployment
 
-`JsonApiRouterTest.cls` exercises the stack end-to-end by populating `RestContext.request`/`RestContext.response` and calling the router's verb methods directly (the standard Apex REST testing pattern). The 13 tests cover pagination/sort, includes, sparse fieldsets, filters, CRUD with relationships, relationship endpoints, dot-path includes (`includesDotPathWithIntermediates` verifies intermediates and leaves are both included with full linkage; `dotPathEmitsToManyLinkageOnIncludedIntermediates` verifies deferred serialization emits to-many linkage on included intermediates and that primary data is never duplicated), nested aliases (`includesNestedRelationshipWithoutIntermediates` verifies intermediates are excluded and shared final-hop records dedupe; `servesNestedRelationshipEndpoints` covers the related/relationship endpoints and the PATCH 403), error mapping, content negotiation, and the root meta document.
+`JsonApiRouterTest.cls` exercises the stack end-to-end by populating `RestContext.request`/`RestContext.response` and calling the router's verb methods directly (the standard Apex REST testing pattern). The 14 tests cover pagination/sort (including sentinel-based `next`-link termination on the final page), includes, sparse fieldsets, filters, CRUD with relationships, relationship endpoints, dot-path includes (`includesDotPathWithIntermediates` verifies intermediates and leaves are both included with full linkage; `dotPathEmitsToManyLinkageOnIncludedIntermediates` verifies deferred serialization emits to-many linkage on included intermediates and that primary data is never duplicated), nested aliases (`includesNestedRelationshipWithoutIntermediates` verifies intermediates are excluded and shared final-hop records dedupe; `servesNestedRelationshipEndpoints` covers the related/relationship endpoints and the PATCH 403), error mapping, content negotiation, and the root meta document.
 
 ```bash
 sf project deploy start --source-dir force-app/main/default/classes

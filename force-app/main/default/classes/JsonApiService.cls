@@ -19,6 +19,7 @@ public with sharing class JsonApiService {
             buildOrderBy(def, qp);
 
         Integer total;
+        Boolean hasNext = false;
         List<SObject> records;
         if (qp.pageSize != null) {
             Integer offset = (qp.pageNumber - 1) * qp.pageSize;
@@ -28,26 +29,19 @@ public with sharing class JsonApiService {
                     'page[number]'
                 );
             }
-            // Cap the COUNT at the remaining query-row budget (counted rows consume it
-            // too), reserving the page itself, so we fail with a clean 400 instead of
-            // an uncatchable LimitException.
-            Integer countCap = remainingQueryRows() - qp.pageSize;
-            if (countCap <= 0) {
+            // No COUNT query: fetch one sentinel row past the page to know whether a
+            // next link is due. total stays null — paginated responses carry no totals.
+            if (qp.pageSize + 1 > queryRowBudget()) {
                 throw resultSetTooLarge();
             }
-            binds.put('jsonApiCountLimit', countCap);
-            total = Database.countQueryWithBinds(
-                'SELECT COUNT() FROM ' + def.sobjectName + whereClause + ' LIMIT :jsonApiCountLimit',
-                binds,
-                AccessLevel.USER_MODE
-            );
-            if (total >= countCap) {
-                throw resultSetTooLarge();
-            }
-            binds.put('jsonApiLimit', qp.pageSize);
+            binds.put('jsonApiLimit', qp.pageSize + 1);
             binds.put('jsonApiOffset', offset);
             soql += ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset';
             records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
+            if (records.size() > qp.pageSize) {
+                hasNext = true;
+                records.remove(qp.pageSize);
+            }
         } else {
             // Unpaginated: no COUNT needed — the result itself is the total. Cap at the
             // remaining query-row budget and treat hitting the cap as truncation.
@@ -66,7 +60,7 @@ public with sharing class JsonApiService {
         for (SObject rec : records) {
             data.add(JsonApiSerializer.resource(rec, def, qp, comp.toManyData));
         }
-        return JsonApiSerializer.document(data, pageLinks(def, qp, total), pageMeta(qp, total), comp.included);
+        return JsonApiSerializer.document(data, pageLinks(def, qp, hasNext), pageMeta(qp, total), comp.included);
     }
 
     // ---------- Single resource: GET /{type}/{id} ----------
@@ -568,21 +562,19 @@ public with sharing class JsonApiService {
         );
     }
 
-    private static Map<String, Object> pageLinks(JsonApiResourceDefinition def, JsonApiQueryParams qp, Integer total) {
+    private static Map<String, Object> pageLinks(JsonApiResourceDefinition def, JsonApiQueryParams qp, Boolean hasNext) {
         if (qp.pageSize == null) {
             return new Map<String, Object>{ 'self' => JsonApiSerializer.baseUrl() + '/' + def.resourceType };
         }
         String base = JsonApiSerializer.baseUrl() + '/' + def.resourceType + '?page%5Bsize%5D=' + qp.pageSize + '&page%5Bnumber%5D=';
-        Integer lastPage = Math.max(1, (Integer) Math.ceil((Decimal) total / qp.pageSize));
         Map<String, Object> links = new Map<String, Object>{
             'self' => base + qp.pageNumber,
-            'first' => base + 1,
-            'last' => base + lastPage
+            'first' => base + 1
         };
         if (qp.pageNumber > 1) {
             links.put('prev', base + (qp.pageNumber - 1));
         }
-        if (qp.pageNumber < lastPage) {
+        if (hasNext) {
             links.put('next', base + (qp.pageNumber + 1));
         }
         return links;
@@ -593,7 +585,6 @@ public with sharing class JsonApiService {
             return new Map<String, Object>{ 'totalResources' => total };
         }
         return new Map<String, Object>{
-            'totalResources' => total,
             'pageNumber' => qp.pageNumber,
             'pageSize' => qp.pageSize
         };
