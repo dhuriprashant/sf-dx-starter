@@ -39,7 +39,6 @@ private class JsonApiRouterTest {
 
         RestResponse res = invoke('GET', '/accounts', null, new Map<String, String>{
             'page[size]' => '2',
-            'page[number]' => '1',
             'sort' => '-name'
         });
 
@@ -54,25 +53,60 @@ private class JsonApiRouterTest {
         Assert.isFalse(meta.containsKey('totalResources'), 'paginated responses carry no totals');
         Assert.areEqual(2, meta.get('pageSize'));
         Map<String, Object> links = (Map<String, Object>) doc.get('links');
-        Assert.isTrue(links.containsKey('next'), 'next link expected on page 1 of 2');
+        Assert.isFalse(links.containsKey('next'), 'sorted pages are not walkable: no next link');
         Assert.isFalse(links.containsKey('last'), 'last link requires a total');
     }
 
     @IsTest
-    static void paginationStopsAtFinalPage() {
-        insert new List<Account>{ makeAccount('Alpha'), makeAccount('Bravo'), makeAccount('Charlie') };
-
+    static void rejectsPageNumber() {
         RestResponse res = invoke('GET', '/accounts', null, new Map<String, String>{
             'page[size]' => '2',
             'page[number]' => '2'
         });
 
+        Assert.areEqual(400, res.statusCode, 'offset pagination is not supported');
+    }
+
+    @IsTest
+    static void cursorPaginationWalksCollection() {
+        insert new List<Account>{ makeAccount('Alpha'), makeAccount('Bravo'), makeAccount('Charlie') };
+
+        RestResponse res = invoke('GET', '/accounts', null, new Map<String, String>{ 'page[size]' => '2' });
+
         Assert.areEqual(200, res.statusCode);
         Map<String, Object> doc = parse(res);
-        Assert.areEqual(1, ((List<Object>) doc.get('data')).size(), 'final partial page');
+        List<Object> data = (List<Object>) doc.get('data');
+        Assert.areEqual(2, data.size());
         Map<String, Object> links = (Map<String, Object>) doc.get('links');
-        Assert.isFalse(links.containsKey('next'), 'no next link on the final page');
-        Assert.isTrue(links.containsKey('prev'));
+        String next = (String) links.get('next');
+        String lastId = (String) ((Map<String, Object>) data[1]).get('id');
+        Assert.isTrue(next.contains('page%5Bafter%5D=' + lastId), 'next link should carry the last record Id as cursor');
+
+        res = invoke('GET', '/accounts', null, new Map<String, String>{
+            'page[size]' => '2',
+            'page[after]' => lastId
+        });
+
+        Assert.areEqual(200, res.statusCode);
+        doc = parse(res);
+        data = (List<Object>) doc.get('data');
+        Assert.areEqual(1, data.size(), 'cursor should resume after the last seen record');
+        Assert.isTrue(String.valueOf(((Map<String, Object>) data[0]).get('id')) > lastId, 'walk must be strictly forward by Id');
+        links = (Map<String, Object>) doc.get('links');
+        Assert.isFalse(links.containsKey('next'), 'no next link at the end of the walk');
+        Map<String, Object> meta = (Map<String, Object>) doc.get('meta');
+        Assert.isFalse(meta.containsKey('pageNumber'), 'cursor pages carry no page number');
+    }
+
+    @IsTest
+    static void rejectsCursorCombinedWithSort() {
+        RestResponse res = invoke('GET', '/accounts', null, new Map<String, String>{
+            'page[size]' => '2',
+            'page[after]' => '001000000000001AAA',
+            'sort' => 'name'
+        });
+
+        Assert.areEqual(400, res.statusCode);
     }
 
     @IsTest

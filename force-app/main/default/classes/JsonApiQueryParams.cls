@@ -1,15 +1,16 @@
 /**
  * Parses and validates JSON:API query parameters against a resource definition:
- * include, fields[TYPE], sort, page[number]/page[size], filter[ATTR].
+ * include, fields[TYPE], sort, page[size]/page[after], filter[ATTR].
  */
 public class JsonApiQueryParams {
     public List<String> include = new List<String>();
     /** resource type -> allowed attribute names (sparse fieldsets) */
     public Map<String, Set<String>> sparseFields = new Map<String, Set<String>>();
     public List<SortField> sorts = new List<SortField>();
-    public Integer pageNumber = 1;
     /** null means no pagination */
     public Integer pageSize;
+    /** cursor: resume after this record Id (keyset pagination, Id ASC order) */
+    public Id after;
     /** JSON attribute name -> raw filter value (comma-separated values mean IN) */
     public Map<String, String> filters = new Map<String, String>();
 
@@ -57,15 +58,38 @@ public class JsonApiQueryParams {
                     qp.sorts.add(sf);
                 }
             } else if (key == 'page[number]') {
-                qp.pageNumber = toPositiveInt(value, 'page[number]');
+                throw JsonApiException.badParameter(
+                    'Offset pagination is not supported; use page[size] and follow next links (page[after] cursor)',
+                    'page[number]'
+                );
             } else if (key == 'page[size]') {
                 qp.pageSize = toPositiveInt(value, 'page[size]');
+            } else if (key == 'page[after]') {
+                try {
+                    qp.after = Id.valueOf(value);
+                } catch (Exception e) {
+                    throw JsonApiException.badParameter('Not a valid record Id: ' + value, 'page[after]');
+                }
+                if (String.valueOf(qp.after.getSobjectType()) != def.sobjectName) {
+                    throw JsonApiException.badParameter(
+                        'Cursor Id does not belong to ' + def.resourceType + ': ' + value,
+                        'page[after]'
+                    );
+                }
             } else if (key.startsWith('filter[') && key.endsWith(']')) {
                 String attr = key.substring(7, key.length() - 1);
                 if (def.fieldFor(attr) == null) {
                     throw JsonApiException.badParameter('Cannot filter by unknown attribute: ' + attr, key);
                 }
                 qp.filters.put(attr, value);
+            }
+        }
+        if (qp.after != null) {
+            if (qp.pageSize == null) {
+                throw JsonApiException.badParameter('page[after] requires page[size]', 'page[after]');
+            }
+            if (!qp.sorts.isEmpty()) {
+                throw JsonApiException.badParameter('page[after] cannot be combined with sort', 'page[after]');
             }
         }
         return qp;

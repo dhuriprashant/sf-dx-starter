@@ -43,7 +43,7 @@ Nine classes under `force-app/main/default/classes/`, in three layers:
 | `JsonApiConfig` | `JsonApiConfig.cls` | The one file you edit to expose an SObject. Declares resource definitions. |
 | `JsonApiRegistry` | `JsonApiRegistry.cls` | Static in-memory map: resource type name → definition. |
 | `JsonApiResourceDefinition` | `JsonApiResourceDefinition.cls` | Fluent builder mapping JSON attribute names ↔ SObject field API names, plus relationship metadata. |
-| `JsonApiQueryParams` | `JsonApiQueryParams.cls` | Parses `include`, `fields[type]`, `sort`, `page[number]/[size]`, `filter[attr]` and validates them against the definition. |
+| `JsonApiQueryParams` | `JsonApiQueryParams.cls` | Parses `include`, `fields[type]`, `sort`, `page[size]/[after]`, `filter[attr]` and validates them against the definition. |
 | `JsonApiSerializer` | `JsonApiSerializer.cls` | SObject → JSON:API resource object; assembles top-level documents and error documents. |
 | `JsonApiException` | `JsonApiException.cls` | Exception carrying HTTP status, title, and JSON:API `source` pointer/parameter. Static factories per status code. |
 | `JsonApiError` | `JsonApiError.cls` | Builds the JSON:API error-object map that gets serialized into error documents. |
@@ -158,14 +158,15 @@ Registration is code, not custom metadata — a deliberate trade-off: type-check
 
 ## 4. Query parameter parsing — JsonApiQueryParams
 
-`parse(req.params, def)` ([JsonApiQueryParams.cls:18-64](../force-app/main/default/classes/JsonApiQueryParams.cls#L18-L64)) walks every query-string key (Apex REST pre-decodes them, so the key literally arrives as `page[number]`) and populates:
+`parse(req.params, def)` ([JsonApiQueryParams.cls:18-64](../force-app/main/default/classes/JsonApiQueryParams.cls#L18-L64)) walks every query-string key (Apex REST pre-decodes them, so the key literally arrives as `page[size]`) and populates:
 
 | Param | Parsed into | Validation |
 | --- | --- | --- |
 | `include=a,b.c` | `List<String> include` (raw names or dot-paths) | each dot-separated segment must be a relationship on the type reached by the previous segment (walked through the registry), else 400 with `source.parameter` |
 | `fields[TYPE]=x,y` | `Map<String, Set<String>> sparseFields` | **not validated** — unknown types/fields simply have no effect at serialization |
 | `sort=-name,createdAt` | `List<SortField>` (`attribute`, `descending`) | each attribute must resolve via `def.fieldFor()`, else 400 |
-| `page[number]` / `page[size]` | `pageNumber` (default 1), `pageSize` (default null = no pagination) | positive integers |
+| `page[size]` | `pageSize` (default null = no pagination) | positive integer; `page[number]` is rejected with a 400 — offset pagination is not supported |
+| `page[after]` | `after` | keyset cursor: a record Id of the target type (prefix-checked); requires `page[size]`, rejects `sort`; walk is `WHERE Id > :after ORDER BY Id ASC` — no OFFSET, unlimited depth |
 | `filter[ATTR]=v1,v2` | `Map<String, String> filters` (raw value; commas = IN) | attribute must resolve via `def.fieldFor()`, else 400 |
 
 Unrecognized parameters are silently ignored. Validation happens **against the definition of the primary resource type in the URL** — this is why parsing needs the `def` and happens after type resolution in the router.
@@ -185,9 +186,9 @@ All SOQL is assembled from **definition-derived identifiers** (field API names f
 ```apex
 'SELECT ' + String.join(def.getSelectFields(), ', ')
 + ' FROM ' + def.sobjectName
-+ whereClause              // 'Field IN :jsonApiFilter0 AND ...' — field names from def, values bound
++ whereClause              // 'Field IN :jsonApiFilter0 AND Id > :jsonApiAfter ...' — field names from def, values bound
 + orderBy                  // field names from def
-+ ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset'
++ ' LIMIT :jsonApiLimit'
 ```
 
 There is no string concatenation of user values into SOQL anywhere; injection surface is limited to names that already passed the `fieldFor()` whitelist.
@@ -198,10 +199,9 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 
 1. `buildWhere()` turns `qp.filters` into `WHERE Field0 IN :jsonApiFilter0 AND Field1 IN :jsonApiFilter1 ...`. Each raw value is comma-split and converted to a **typed list** by `typedFilterValues()` ([JsonApiService.cls:449-491](../force-app/main/default/classes/JsonApiService.cls#L449-L491)) — `List<Date>`, `List<Datetime>`, `List<Decimal>`, `List<Boolean>`, or `List<String>` depending on the field's describe type. This exists because SOQL rejects `List<Object>` binds ("Invalid bind expression type of ANY").
 2. No COUNT query is ever run. Paginated requests fetch `pageSize + 1` rows — the sentinel row's presence decides the `next` link — so a page costs only `pageSize + 1` of the 50k query-row governor budget regardless of collection size. Unpaginated requests fetch everything, capped with a `LIMIT` at the remaining budget; filling the cap is treated as truncation and throws a 400 "Result Set Too Large" instead of an uncatchable `LimitException` (`totalResources` is `records.size()`).
-3. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus, when `page[size]` was given, `LIMIT :jsonApiLimit OFFSET :jsonApiOffset` computed as `(pageNumber - 1) * pageSize`. Without `page[size]` the query is unpaginated.
-4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev, plus next when the sentinel row was present — no `last`, since there is no total; `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`pageNumber`, `pageSize`; no `totalResources`). Unpaginated requests get only a `self` link and `totalResources`.
-
-Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000 (`MAX_SOQL_OFFSET`), so a page starting beyond row 2000 is rejected up front with a 400 Invalid Query Parameter on `page[number]` — before any query runs.
+3. With `page[after]`, `Id > :jsonApiAfter` is ANDed into the WHERE and the fallback `ORDER BY Id ASC` provides the matching order (`sort` is rejected with a cursor). `next` carries the last returned record's Id, so following links walks a collection of any size in `pageSize` steps — no OFFSET is ever used, so there is no depth limit. The walk is not a snapshot: rows inserted behind the cursor mid-walk are missed.
+4. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus `LIMIT :jsonApiLimit` (`pageSize + 1`, or the row budget when unpaginated).
+5. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (`self`/`first`, plus `next` when the sentinel row was present *and* the page is unsorted — the cursor cannot resume a custom sort order, so a sorted page is always the only page; `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`pageSize` only). Unpaginated requests get only a `self` link and `totalResources`.
 
 ### 5.3 GET /{type}/{id} — getResource and fetchById
 
@@ -337,10 +337,10 @@ Authentication is standard Salesforce OAuth — Apex REST requires a valid sessi
 3. `pathSegments` → `['accounts']`; `JsonApiRegistry.get('accounts')` resolves the definition.
 4. `JsonApiQueryParams.parse`: `include=['contacts']` (validated against accounts' relationships), `sparseFields={'contacts': {'firstName'}}`, `sorts=[{name, desc}]`, `pageSize=2`.
 5. `listResources`:
-   - `SELECT Id, Name, Industry, Phone, Website, NumberOfEmployees, CreatedDate FROM Account ORDER BY Name DESC NULLS LAST LIMIT :3 OFFSET :0` (USER_MODE) — `pageSize + 1`; the third (sentinel) row means there's a next page and is trimmed from the result.
+   - `SELECT Id, Name, Industry, Phone, Website, NumberOfEmployees, CreatedDate FROM Account ORDER BY Name DESC NULLS LAST LIMIT :3` (USER_MODE) — `pageSize + 1`; the third (sentinel) row is trimmed from the result. Because the page is sorted, no `next` link is emitted regardless of the sentinel (the cursor cannot resume a name-ordered walk).
    - `buildCompound`: one query `SELECT Id, FirstName, ..., AccountId FROM Contact WHERE AccountId IN :(2 account ids)`; children grouped per account into `toManyData['contacts']`; each contact serialized (sparse → only `firstName` attribute) into `included`.
    - Each account serialized with `relationships.contacts.data` = its identifier list.
-   - Document assembled with `links` (self/first/next) and `meta` `{pageNumber: 1, pageSize: 2}`.
+   - Document assembled with `links` (self/first) and `meta` `{pageSize: 2}`.
 6. Router serializes the map, status 200.
 
 Total: **2 SOQL queries** for the whole request, independent of row counts.
@@ -356,7 +356,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 - **Nested aliases can't nest.** A `.nested()` path segment must be a direct relationship — an alias can't reference another alias (500 Configuration Error). Dot-path *includes* may use aliases as segments, though.
 - **No include-path depth limit.** Dot-paths of any length are accepted; each segment costs one query, so a hostile deep path costs `pathLength` queries (bounded in practice by exposed relationships and the 100-SOQL governor limit).
 - **Filters are equality/IN only** — no `filter[amount][gte]`-style operators; multiple filters always AND.
-- **OFFSET pagination** caps at SOQL's 2000-row offset (rejected proactively as a 400 on `page[number]`); no cursor strategy, so rows past 2000 + pageSize are only reachable by filtering.
+- **Pagination is cursor-only.** `page[number]` is rejected (400); the `page[after]` keyset cursor has unlimited depth but is forward-only, Id-ordered, and not a point-in-time snapshot. Consequently a **sorted page is not walkable**: `sort` + `page[size]` returns the top page with no `next` link, because the cursor cannot resume a custom sort order.
 - **Query-row budget guards are truncation-based.** List, `queryByIds`, and `queryChildren` queries are each capped at the remaining 50k transaction budget and throw a 400 "Result Set Too Large" on hitting the cap — including a result that legitimately fills the budget exactly. Heap/CPU limits are not guarded.
 - **To-many linkage is read-only** (`PATCH /relationships/{toMany}` → 403), and full-replacement POST/DELETE on to-many relationship endpoints isn't implemented.
 - **No client-generated IDs** (403 per the optional part of the spec) and **no atomic multi-operation extension**.
@@ -366,7 +366,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 
 ## 11. Tests & deployment
 
-`JsonApiRouterTest.cls` exercises the stack end-to-end by populating `RestContext.request`/`RestContext.response` and calling the router's verb methods directly (the standard Apex REST testing pattern). The 14 tests cover pagination/sort (including sentinel-based `next`-link termination on the final page), includes, sparse fieldsets, filters, CRUD with relationships, relationship endpoints, dot-path includes (`includesDotPathWithIntermediates` verifies intermediates and leaves are both included with full linkage; `dotPathEmitsToManyLinkageOnIncludedIntermediates` verifies deferred serialization emits to-many linkage on included intermediates and that primary data is never duplicated), nested aliases (`includesNestedRelationshipWithoutIntermediates` verifies intermediates are excluded and shared final-hop records dedupe; `servesNestedRelationshipEndpoints` covers the related/relationship endpoints and the PATCH 403), error mapping, content negotiation, and the root meta document.
+`JsonApiRouterTest.cls` exercises the stack end-to-end by populating `RestContext.request`/`RestContext.response` and calling the router's verb methods directly (the standard Apex REST testing pattern). The 16 tests cover pagination/sort (a keyset-cursor walk via `page[after]` with `next`-link termination, the `page[number]` rejection, and the cursor+sort rejection), includes, sparse fieldsets, filters, CRUD with relationships, relationship endpoints, dot-path includes (`includesDotPathWithIntermediates` verifies intermediates and leaves are both included with full linkage; `dotPathEmitsToManyLinkageOnIncludedIntermediates` verifies deferred serialization emits to-many linkage on included intermediates and that primary data is never duplicated), nested aliases (`includesNestedRelationshipWithoutIntermediates` verifies intermediates are excluded and shared final-hop records dedupe; `servesNestedRelationshipEndpoints` covers the related/relationship endpoints and the PATCH 403), error mapping, content negotiation, and the root meta document.
 
 ```bash
 sf project deploy start --source-dir force-app/main/default/classes

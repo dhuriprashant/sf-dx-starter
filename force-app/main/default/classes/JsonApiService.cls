@@ -3,14 +3,19 @@
  * run in USER_MODE so object/field-level security and sharing are enforced.
  */
 public with sharing class JsonApiService {
-    /** Platform ceiling for SOQL OFFSET; deeper pages are rejected up front. */
-    private static final Integer MAX_SOQL_OFFSET = 2000;
-
     // ---------- Collection: GET /{type} ----------
 
     public static Map<String, Object> listResources(JsonApiResourceDefinition def, JsonApiQueryParams qp) {
         Map<String, Object> binds = new Map<String, Object>();
         String whereClause = buildWhere(def, qp, binds);
+
+        // Keyset cursor: resume strictly after the given Id. Correct only under Id ASC
+        // ordering, which holds because the parser rejects page[after] + sort and
+        // buildOrderBy falls back to ORDER BY Id ASC when no sort is given.
+        if (qp.after != null) {
+            whereClause += (whereClause == '' ? ' WHERE ' : ' AND ') + 'Id > :jsonApiAfter';
+            binds.put('jsonApiAfter', qp.after);
+        }
 
         String soql =
             'SELECT ' + String.join(def.getSelectFields(), ', ') +
@@ -22,26 +27,20 @@ public with sharing class JsonApiService {
         Boolean hasNext = false;
         List<SObject> records;
         if (qp.pageSize != null) {
-            Integer offset = (qp.pageNumber - 1) * qp.pageSize;
-            if (offset > MAX_SOQL_OFFSET) {
-                throw JsonApiException.badParameter(
-                    'The requested page starts at row ' + offset + ', beyond the maximum SOQL offset of ' + MAX_SOQL_OFFSET + '; use a smaller page[size] or narrow the result with filter[...].',
-                    'page[number]'
-                );
-            }
             // No COUNT query: fetch one sentinel row past the page to know whether a
             // next link is due. total stays null — paginated responses carry no totals.
             if (qp.pageSize + 1 > queryRowBudget()) {
                 throw resultSetTooLarge();
             }
             binds.put('jsonApiLimit', qp.pageSize + 1);
-            binds.put('jsonApiOffset', offset);
-            soql += ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset';
+            soql += ' LIMIT :jsonApiLimit';
             records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
             if (records.size() > qp.pageSize) {
                 hasNext = true;
                 records.remove(qp.pageSize);
             }
+        } else if (qp.after != null) {
+            throw JsonApiException.badParameter('page[after] requires page[size]', 'page[after]');
         } else {
             // Unpaginated: no COUNT needed — the result itself is the total. Cap at the
             // remaining query-row budget and treat hitting the cap as truncation.
@@ -60,7 +59,8 @@ public with sharing class JsonApiService {
         for (SObject rec : records) {
             data.add(JsonApiSerializer.resource(rec, def, qp, comp.toManyData));
         }
-        return JsonApiSerializer.document(data, pageLinks(def, qp, hasNext), pageMeta(qp, total), comp.included);
+        Id nextCursor = hasNext ? records[records.size() - 1].Id : null;
+        return JsonApiSerializer.document(data, pageLinks(def, qp, hasNext, nextCursor), pageMeta(qp, total), comp.included);
     }
 
     // ---------- Single resource: GET /{type}/{id} ----------
@@ -562,20 +562,24 @@ public with sharing class JsonApiService {
         );
     }
 
-    private static Map<String, Object> pageLinks(JsonApiResourceDefinition def, JsonApiQueryParams qp, Boolean hasNext) {
+    private static Map<String, Object> pageLinks(
+        JsonApiResourceDefinition def,
+        JsonApiQueryParams qp,
+        Boolean hasNext,
+        Id nextCursor
+    ) {
         if (qp.pageSize == null) {
             return new Map<String, Object>{ 'self' => JsonApiSerializer.baseUrl() + '/' + def.resourceType };
         }
-        String base = JsonApiSerializer.baseUrl() + '/' + def.resourceType + '?page%5Bsize%5D=' + qp.pageSize + '&page%5Bnumber%5D=';
+        String base = JsonApiSerializer.baseUrl() + '/' + def.resourceType + '?page%5Bsize%5D=' + qp.pageSize;
         Map<String, Object> links = new Map<String, Object>{
-            'self' => base + qp.pageNumber,
-            'first' => base + 1
+            'self' => qp.after != null ? base + '&page%5Bafter%5D=' + qp.after : base,
+            'first' => base
         };
-        if (qp.pageNumber > 1) {
-            links.put('prev', base + (qp.pageNumber - 1));
-        }
-        if (hasNext) {
-            links.put('next', base + (qp.pageNumber + 1));
+        // The keyset cursor cannot resume a custom sort order, so a sorted page is
+        // always the only page: no next link even when more rows match.
+        if (hasNext && qp.sorts.isEmpty()) {
+            links.put('next', base + '&page%5Bafter%5D=' + nextCursor);
         }
         return links;
     }
@@ -584,10 +588,7 @@ public with sharing class JsonApiService {
         if (qp.pageSize == null) {
             return new Map<String, Object>{ 'totalResources' => total };
         }
-        return new Map<String, Object>{
-            'pageNumber' => qp.pageNumber,
-            'pageSize' => qp.pageSize
-        };
+        return new Map<String, Object>{ 'pageSize' => qp.pageSize };
     }
 
     private static Map<String, Object> relatedLinks(JsonApiResourceDefinition def, Id recordId, String relName) {
