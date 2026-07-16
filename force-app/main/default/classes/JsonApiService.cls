@@ -35,6 +35,7 @@ public with sharing class JsonApiService {
             binds.put('jsonApiLimit', qp.pageSize + 1);
             soql += ' LIMIT :jsonApiLimit';
             records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
+            checkHeapHeadroom();
             if (records.size() > qp.pageSize) {
                 hasNext = true;
                 records.remove(qp.pageSize);
@@ -51,6 +52,7 @@ public with sharing class JsonApiService {
             if (records.size() >= budget) {
                 throw resultSetTooLarge();
             }
+            checkHeapHeadroom();
             total = records.size();
         }
 
@@ -449,6 +451,7 @@ public with sharing class JsonApiService {
         if (recs.size() >= budget) {
             throw resultSetTooLarge();
         }
+        checkHeapHeadroom();
         return recs;
     }
 
@@ -465,6 +468,7 @@ public with sharing class JsonApiService {
         if (recs.size() >= budget) {
             throw resultSetTooLarge();
         }
+        checkHeapHeadroom();
         return recs;
     }
 
@@ -560,6 +564,21 @@ public with sharing class JsonApiService {
             'Result Set Too Large',
             'Matching records exceed the transaction query row limit; narrow the result with filter[...], request a smaller page[size], or reduce ?include.'
         );
+    }
+
+    /**
+     * Serializing roughly triples the records' footprint (SObjects, document maps,
+     * JSON string), so require that headroom now and fail with a clean 400 while
+     * the error document can still be built — a heap LimitException is uncatchable.
+     */
+    private static void checkHeapHeadroom() {
+        if (Limits.getHeapSize() * 3 > Limits.getLimitHeapSize()) {
+            throw JsonApiException.of(
+                400,
+                'Response Too Large',
+                'The response would exceed the transaction heap limit; narrow the result with filter[...], request a smaller page[size], or reduce ?include.'
+            );
+        }
     }
 
     private static Map<String, Object> pageLinks(
