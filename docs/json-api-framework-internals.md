@@ -165,7 +165,7 @@ Registration is code, not custom metadata — a deliberate trade-off: type-check
 | `include=a,b.c` | `List<String> include` (raw names or dot-paths) | each dot-separated segment must be a relationship on the type reached by the previous segment (walked through the registry), else 400 with `source.parameter` |
 | `fields[TYPE]=x,y` | `Map<String, Set<String>> sparseFields` | **not validated** — unknown types/fields simply have no effect at serialization |
 | `sort=-name,createdAt` | `List<SortField>` (`attribute`, `descending`) | each attribute must resolve via `def.fieldFor()`, else 400 |
-| `page[number]` / `page[size]` | `pageNumber` (default 1), `pageSize` (default 20) | positive integers; size clamped to `MAX_PAGE_SIZE = 200` |
+| `page[number]` / `page[size]` | `pageNumber` (default 1), `pageSize` (default null = no pagination) | positive integers |
 | `filter[ATTR]=v1,v2` | `Map<String, String> filters` (raw value; commas = IN) | attribute must resolve via `def.fieldFor()`, else 400 |
 
 Unrecognized parameters are silently ignored. Validation happens **against the definition of the primary resource type in the URL** — this is why parsing needs the `def` and happens after type resolution in the router.
@@ -197,9 +197,9 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 ([JsonApiService.cls:8-34](../force-app/main/default/classes/JsonApiService.cls#L8-L34))
 
 1. `buildWhere()` turns `qp.filters` into `WHERE Field0 IN :jsonApiFilter0 AND Field1 IN :jsonApiFilter1 ...`. Each raw value is comma-split and converted to a **typed list** by `typedFilterValues()` ([JsonApiService.cls:449-491](../force-app/main/default/classes/JsonApiService.cls#L449-L491)) — `List<Date>`, `List<Datetime>`, `List<Decimal>`, `List<Boolean>`, or `List<String>` depending on the field's describe type. This exists because SOQL rejects `List<Object>` binds ("Invalid bind expression type of ANY").
-2. `Database.countQueryWithBinds` runs `SELECT COUNT()` with the same WHERE to get `totalResources` for pagination meta/links.
-3. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus `LIMIT :jsonApiLimit OFFSET :jsonApiOffset` computed as `(pageNumber - 1) * pageSize`.
-4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev/next/last, with `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`totalResources`, `pageNumber`, `pageSize`).
+2. For paginated requests, `Database.countQueryWithBinds` runs `SELECT COUNT()` with the same WHERE to get `totalResources` for pagination meta/links. Counted rows consume the 50k query-row governor budget, so the COUNT is capped with a `LIMIT` at the remaining budget (minus the page itself); hitting the cap throws a 400 "Result Set Too Large" instead of an uncatchable `LimitException`. Unpaginated requests skip the COUNT — the result itself is the total — and cap the data query the same way.
+3. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus, when `page[size]` was given, `LIMIT :jsonApiLimit OFFSET :jsonApiOffset` computed as `(pageNumber - 1) * pageSize`. Without `page[size]` the query is unpaginated.
+4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev/next/last, with `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`totalResources`, `pageNumber`, `pageSize`). Unpaginated requests get only a `self` link and `totalResources`.
 
 Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000, so pages beyond `2000 / pageSize` fail with a QueryException (surfaced as 400).
 
@@ -358,6 +358,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 - **No include-path depth limit.** Dot-paths of any length are accepted; each segment costs one query, so a hostile deep path costs `pathLength` queries (bounded in practice by exposed relationships and the 100-SOQL governor limit).
 - **Filters are equality/IN only** — no `filter[amount][gte]`-style operators; multiple filters always AND.
 - **OFFSET pagination** caps at SOQL's 2000-row offset; no cursor strategy.
+- **Query-row budget guards are truncation-based.** List, `queryByIds`, and `queryChildren` queries are each capped at the remaining 50k transaction budget and throw a 400 "Result Set Too Large" on hitting the cap — including a result that legitimately fills the budget exactly. Heap/CPU limits are not guarded.
 - **To-many linkage is read-only** (`PATCH /relationships/{toMany}` → 403), and full-replacement POST/DELETE on to-many relationship endpoints isn't implemented.
 - **No client-generated IDs** (403 per the optional part of the spec) and **no atomic multi-operation extension**.
 - **Registrations are code**, not Custom Metadata — exposing an object requires a deploy.

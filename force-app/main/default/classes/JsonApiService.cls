@@ -9,21 +9,47 @@ public with sharing class JsonApiService {
         Map<String, Object> binds = new Map<String, Object>();
         String whereClause = buildWhere(def, qp, binds);
 
-        Integer total = Database.countQueryWithBinds(
-            'SELECT COUNT() FROM ' + def.sobjectName + whereClause,
-            binds,
-            AccessLevel.USER_MODE
-        );
-
-        binds.put('jsonApiLimit', qp.pageSize);
-        binds.put('jsonApiOffset', (qp.pageNumber - 1) * qp.pageSize);
         String soql =
             'SELECT ' + String.join(def.getSelectFields(), ', ') +
             ' FROM ' + def.sobjectName +
             whereClause +
-            buildOrderBy(def, qp) +
-            ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset';
-        List<SObject> records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
+            buildOrderBy(def, qp);
+
+        Integer total;
+        List<SObject> records;
+        if (qp.pageSize != null) {
+            // Cap the COUNT at the remaining query-row budget (counted rows consume it
+            // too), reserving the page itself, so we fail with a clean 400 instead of
+            // an uncatchable LimitException.
+            Integer countCap = remainingQueryRows() - qp.pageSize;
+            if (countCap <= 0) {
+                throw resultSetTooLarge();
+            }
+            binds.put('jsonApiCountLimit', countCap);
+            total = Database.countQueryWithBinds(
+                'SELECT COUNT() FROM ' + def.sobjectName + whereClause + ' LIMIT :jsonApiCountLimit',
+                binds,
+                AccessLevel.USER_MODE
+            );
+            if (total >= countCap) {
+                throw resultSetTooLarge();
+            }
+            binds.put('jsonApiLimit', qp.pageSize);
+            binds.put('jsonApiOffset', (qp.pageNumber - 1) * qp.pageSize);
+            soql += ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset';
+            records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
+        } else {
+            // Unpaginated: no COUNT needed — the result itself is the total. Cap at the
+            // remaining query-row budget and treat hitting the cap as truncation.
+            Integer budget = queryRowBudget();
+            binds.put('jsonApiLimit', budget);
+            soql += ' LIMIT :jsonApiLimit';
+            records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
+            if (records.size() >= budget) {
+                throw resultSetTooLarge();
+            }
+            total = records.size();
+        }
 
         Compound comp = buildCompound(records, def, qp);
         List<Map<String, Object>> data = new List<Map<String, Object>>();
@@ -409,23 +435,33 @@ public with sharing class JsonApiService {
     }
 
     private static List<SObject> queryByIds(JsonApiResourceDefinition def, Set<Id> ids) {
-        return Database.queryWithBinds(
+        Integer budget = queryRowBudget();
+        List<SObject> recs = Database.queryWithBinds(
             'SELECT ' + String.join(def.getSelectFields(), ', ') +
-                ' FROM ' + def.sobjectName + ' WHERE Id IN :jsonApiIds',
-            new Map<String, Object>{ 'jsonApiIds' => ids },
+                ' FROM ' + def.sobjectName + ' WHERE Id IN :jsonApiIds LIMIT :jsonApiBudget',
+            new Map<String, Object>{ 'jsonApiIds' => ids, 'jsonApiBudget' => budget },
             AccessLevel.USER_MODE
         );
+        if (recs.size() >= budget) {
+            throw resultSetTooLarge();
+        }
+        return recs;
     }
 
     private static List<SObject> queryChildren(JsonApiResourceDefinition childDef, String fkField, Set<Id> parentIds) {
         Set<String> fields = new Set<String>(childDef.getSelectFields());
         fields.add(fkField);
-        return Database.queryWithBinds(
+        Integer budget = queryRowBudget();
+        List<SObject> recs = Database.queryWithBinds(
             'SELECT ' + String.join(new List<String>(fields), ', ') +
-                ' FROM ' + childDef.sobjectName + ' WHERE ' + fkField + ' IN :jsonApiParentIds',
-            new Map<String, Object>{ 'jsonApiParentIds' => parentIds },
+                ' FROM ' + childDef.sobjectName + ' WHERE ' + fkField + ' IN :jsonApiParentIds LIMIT :jsonApiBudget',
+            new Map<String, Object>{ 'jsonApiParentIds' => parentIds, 'jsonApiBudget' => budget },
             AccessLevel.USER_MODE
         );
+        if (recs.size() >= budget) {
+            throw resultSetTooLarge();
+        }
+        return recs;
     }
 
     private static String buildWhere(JsonApiResourceDefinition def, JsonApiQueryParams qp, Map<String, Object> binds) {
@@ -501,7 +537,31 @@ public with sharing class JsonApiService {
         return ' ORDER BY ' + String.join(parts, ', ');
     }
 
+    private static Integer remainingQueryRows() {
+        return Limits.getLimitQueryRows() - Limits.getQueryRows();
+    }
+
+    /** Remaining query-row budget; throws if already exhausted. */
+    private static Integer queryRowBudget() {
+        Integer budget = remainingQueryRows();
+        if (budget <= 0) {
+            throw resultSetTooLarge();
+        }
+        return budget;
+    }
+
+    private static JsonApiException resultSetTooLarge() {
+        return JsonApiException.of(
+            400,
+            'Result Set Too Large',
+            'Matching records exceed the transaction query row limit; narrow the result with filter[...], request a smaller page[size], or reduce ?include.'
+        );
+    }
+
     private static Map<String, Object> pageLinks(JsonApiResourceDefinition def, JsonApiQueryParams qp, Integer total) {
+        if (qp.pageSize == null) {
+            return new Map<String, Object>{ 'self' => JsonApiSerializer.baseUrl() + '/' + def.resourceType };
+        }
         String base = JsonApiSerializer.baseUrl() + '/' + def.resourceType + '?page%5Bsize%5D=' + qp.pageSize + '&page%5Bnumber%5D=';
         Integer lastPage = Math.max(1, (Integer) Math.ceil((Decimal) total / qp.pageSize));
         Map<String, Object> links = new Map<String, Object>{
@@ -519,6 +579,9 @@ public with sharing class JsonApiService {
     }
 
     private static Map<String, Object> pageMeta(JsonApiQueryParams qp, Integer total) {
+        if (qp.pageSize == null) {
+            return new Map<String, Object>{ 'totalResources' => total };
+        }
         return new Map<String, Object>{
             'totalResources' => total,
             'pageNumber' => qp.pageNumber,

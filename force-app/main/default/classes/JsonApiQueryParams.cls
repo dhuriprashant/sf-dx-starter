@@ -3,15 +3,13 @@
  * include, fields[TYPE], sort, page[number]/page[size], filter[ATTR].
  */
 public class JsonApiQueryParams {
-    public static final Integer DEFAULT_PAGE_SIZE = 20;
-    public static final Integer MAX_PAGE_SIZE = 200;
-
     public List<String> include = new List<String>();
     /** resource type -> allowed attribute names (sparse fieldsets) */
     public Map<String, Set<String>> sparseFields = new Map<String, Set<String>>();
     public List<SortField> sorts = new List<SortField>();
     public Integer pageNumber = 1;
-    public Integer pageSize = DEFAULT_PAGE_SIZE;
+    /** null means no pagination */
+    public Integer pageSize;
     /** JSON attribute name -> raw filter value (comma-separated values mean IN) */
     public Map<String, String> filters = new Map<String, String>();
 
@@ -61,7 +59,7 @@ public class JsonApiQueryParams {
             } else if (key == 'page[number]') {
                 qp.pageNumber = toPositiveInt(value, 'page[number]');
             } else if (key == 'page[size]') {
-                qp.pageSize = Math.min(toPositiveInt(value, 'page[size]'), MAX_PAGE_SIZE);
+                qp.pageSize = toPositiveInt(value, 'page[size]');
             } else if (key.startsWith('filter[') && key.endsWith(']')) {
                 String attr = key.substring(7, key.length() - 1);
                 if (def.fieldFor(attr) == null) {
