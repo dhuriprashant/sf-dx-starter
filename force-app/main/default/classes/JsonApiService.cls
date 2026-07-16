@@ -3,6 +3,9 @@
  * run in USER_MODE so object/field-level security and sharing are enforced.
  */
 public with sharing class JsonApiService {
+    /** Platform ceiling for SOQL OFFSET; deeper pages are rejected up front. */
+    private static final Integer MAX_SOQL_OFFSET = 2000;
+
     // ---------- Collection: GET /{type} ----------
 
     public static Map<String, Object> listResources(JsonApiResourceDefinition def, JsonApiQueryParams qp) {
@@ -18,6 +21,13 @@ public with sharing class JsonApiService {
         Integer total;
         List<SObject> records;
         if (qp.pageSize != null) {
+            Integer offset = (qp.pageNumber - 1) * qp.pageSize;
+            if (offset > MAX_SOQL_OFFSET) {
+                throw JsonApiException.badParameter(
+                    'The requested page starts at row ' + offset + ', beyond the maximum SOQL offset of ' + MAX_SOQL_OFFSET + '; use a smaller page[size] or narrow the result with filter[...].',
+                    'page[number]'
+                );
+            }
             // Cap the COUNT at the remaining query-row budget (counted rows consume it
             // too), reserving the page itself, so we fail with a clean 400 instead of
             // an uncatchable LimitException.
@@ -35,7 +45,7 @@ public with sharing class JsonApiService {
                 throw resultSetTooLarge();
             }
             binds.put('jsonApiLimit', qp.pageSize);
-            binds.put('jsonApiOffset', (qp.pageNumber - 1) * qp.pageSize);
+            binds.put('jsonApiOffset', offset);
             soql += ' LIMIT :jsonApiLimit OFFSET :jsonApiOffset';
             records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
         } else {

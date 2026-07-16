@@ -201,7 +201,7 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 3. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus, when `page[size]` was given, `LIMIT :jsonApiLimit OFFSET :jsonApiOffset` computed as `(pageNumber - 1) * pageSize`. Without `page[size]` the query is unpaginated.
 4. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (self/first/prev/next/last, with `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`totalResources`, `pageNumber`, `pageSize`). Unpaginated requests get only a `self` link and `totalResources`.
 
-Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000, so pages beyond `2000 / pageSize` fail with a QueryException (surfaced as 400).
+Note the OFFSET ceiling: SOQL OFFSET maxes out at 2000 (`MAX_SOQL_OFFSET`), so a page starting beyond row 2000 is rejected up front with a 400 Invalid Query Parameter on `page[number]` — before the COUNT query spends any budget.
 
 ### 5.3 GET /{type}/{id} — getResource and fetchById
 
@@ -357,7 +357,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 - **Nested aliases can't nest.** A `.nested()` path segment must be a direct relationship — an alias can't reference another alias (500 Configuration Error). Dot-path *includes* may use aliases as segments, though.
 - **No include-path depth limit.** Dot-paths of any length are accepted; each segment costs one query, so a hostile deep path costs `pathLength` queries (bounded in practice by exposed relationships and the 100-SOQL governor limit).
 - **Filters are equality/IN only** — no `filter[amount][gte]`-style operators; multiple filters always AND.
-- **OFFSET pagination** caps at SOQL's 2000-row offset; no cursor strategy.
+- **OFFSET pagination** caps at SOQL's 2000-row offset (rejected proactively as a 400 on `page[number]`); no cursor strategy, so rows past 2000 + pageSize are only reachable by filtering.
 - **Query-row budget guards are truncation-based.** List, `queryByIds`, and `queryChildren` queries are each capped at the remaining 50k transaction budget and throw a 400 "Result Set Too Large" on hitting the cap — including a result that legitimately fills the budget exactly. Heap/CPU limits are not guarded.
 - **To-many linkage is read-only** (`PATCH /relationships/{toMany}` → 403), and full-replacement POST/DELETE on to-many relationship endpoints isn't implemented.
 - **No client-generated IDs** (403 per the optional part of the spec) and **no atomic multi-operation extension**.
