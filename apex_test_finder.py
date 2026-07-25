@@ -124,7 +124,7 @@ def find_by_static_analysis(
 # Org query via Salesforce CLI
 # ---------------------------------------------------------------------------
 
-def _run_sf(args: list[str], target_org: Optional[str]) -> dict:
+def _run_sf(args: list[str], target_org: Optional[str], exit_on_error: bool = True) -> dict:
     """Run `sf <args> --json` and return parsed JSON output."""
     cmd = ["sf"] + args + ["--json"]
     if target_org:
@@ -135,7 +135,8 @@ def _run_sf(args: list[str], target_org: Optional[str]) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300,
+            shell=(sys.platform == "win32"),
         )
     except FileNotFoundError:
         sys.exit(
@@ -143,7 +144,7 @@ def _run_sf(args: list[str], target_org: Optional[str]) -> dict:
             "https://developer.salesforce.com/tools/salesforcecli"
         )
     except subprocess.TimeoutExpired:
-        sys.exit("[org] ERROR: sf CLI timed out after 120 s.")
+        sys.exit("[org] ERROR: sf CLI timed out after 300 s.")
 
     try:
         data = json.loads(proc.stdout)
@@ -153,11 +154,35 @@ def _run_sf(args: list[str], target_org: Optional[str]) -> dict:
             f"STDOUT: {proc.stdout[:500]}\nSTDERR: {proc.stderr[:500]}"
         )
 
-    if data.get("status", 0) != 0:
+    if exit_on_error and data.get("status", 0) != 0:
         msg = data.get("message") or proc.stderr or "unknown error"
         sys.exit(f"[org] ERROR from sf CLI: {msg}")
 
     return data
+
+
+def run_tests_in_org(
+    test_class_names: list[str],
+    target_org: Optional[str],
+) -> None:
+    """Run the given test classes synchronously in the org to populate coverage data."""
+    print(
+        f"[org]    Running {len(test_class_names)} test class(es) to generate coverage: "
+        f"{', '.join(test_class_names)}",
+        file=sys.stderr,
+    )
+
+    args = ["apex", "run", "test", "--synchronous"]
+    for name in test_class_names:
+        args += ["--class-names", name]
+
+    # exit_on_error=False: some tests may fail but coverage is still recorded
+    data = _run_sf(args, target_org, exit_on_error=False)
+
+    summary = data.get("result", {}).get("summary", {})
+    passed = summary.get("passing", 0) or 0
+    failed = summary.get("failing", 0) or 0
+    print(f"[org]    Test run complete — {passed} passed, {failed} failed.", file=sys.stderr)
 
 
 def find_by_org_coverage(
@@ -170,7 +195,7 @@ def find_by_org_coverage(
     """
     soql = (
         "SELECT ApexTestClass.Name, NumLinesCovered, NumLinesUncovered "
-        "FROM ApexCodeCoverageAggregate "
+        "FROM ApexCodeCoverage "
         f"WHERE ApexClassOrTrigger.Name = '{class_name}'"
     )
 
@@ -365,6 +390,19 @@ def main() -> None:
     if use_org:
         org_results = find_by_org_coverage(class_name, args.target_org)
         print(f"[org]    Found {len(org_results)} coverage record(s).", file=sys.stderr)
+
+        if not org_results:
+            # No stored coverage — find test candidates via static analysis and run them
+            candidates = static_results or find_by_static_analysis(class_name, project_dir)
+            if candidates:
+                run_tests_in_org([r.name for r in candidates], args.target_org)
+                org_results = find_by_org_coverage(class_name, args.target_org)
+                print(f"[org]    Found {len(org_results)} coverage record(s) after test run.", file=sys.stderr)
+            else:
+                print(
+                    "[org]    No test candidates found by static analysis — cannot auto-run tests.",
+                    file=sys.stderr,
+                )
 
     if use_static and use_org:
         results = merge_results(static_results, org_results)
