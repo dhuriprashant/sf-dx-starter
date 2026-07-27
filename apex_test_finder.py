@@ -172,7 +172,7 @@ def run_tests_in_org(
         file=sys.stderr,
     )
 
-    args = ["apex", "run", "test", "--synchronous"]
+    args = ["apex", "test", "run", "--wait", "10", "--code-coverage"]
     for name in test_class_names:
         args += ["--class-names", name]
 
@@ -214,15 +214,23 @@ def find_by_org_coverage(
         )
         return []
 
-    results: list[TestClassResult] = []
+    # Aggregate per-method rows into one entry per test class
+    totals: dict[str, list[int]] = {}  # name -> [covered, uncovered]
     for rec in records:
         test_class = rec.get("ApexTestClass") or {}
         name = test_class.get("Name", "<unknown>")
         covered = rec.get("NumLinesCovered", 0) or 0
         uncovered = rec.get("NumLinesUncovered", 0) or 0
+        if name in totals:
+            totals[name][0] += covered
+            totals[name][1] += uncovered
+        else:
+            totals[name] = [covered, uncovered]
+
+    results: list[TestClassResult] = []
+    for name, (covered, uncovered) in totals.items():
         total = covered + uncovered
         pct = (covered / total * 100) if total > 0 else 0.0
-
         results.append(
             TestClassResult(
                 name=name,
