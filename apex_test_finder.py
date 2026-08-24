@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -48,6 +49,21 @@ class TestClassResult:
         if self.coverage_pct is not None:
             return f"{self.coverage_pct:.1f}%"
         return "n/a"
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+# Apex identifiers: letter followed by letters, digits or underscores (max 40 chars).
+_APEX_IDENTIFIER_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,39}$')
+
+
+def apex_identifier(value: str) -> str:
+    """Validate an Apex class name before it reaches a SOQL query or the sf CLI."""
+    if not _APEX_IDENTIFIER_RE.match(value):
+        raise ValueError(f"not a valid Apex class name: {value!r}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +142,14 @@ def find_by_static_analysis(
 
 def _run_sf(args: list[str], target_org: Optional[str], exit_on_error: bool = True) -> dict:
     """Run `sf <args> --json` and return parsed JSON output."""
-    cmd = ["sf"] + args + ["--json"]
+    sf = shutil.which("sf")
+    if sf is None:
+        sys.exit(
+            "[org] ERROR: `sf` CLI not found. Install Salesforce CLI: "
+            "https://developer.salesforce.com/tools/salesforcecli"
+        )
+
+    cmd = [sf] + args + ["--json"]
     if target_org:
         cmd += ["--target-org", target_org]
 
@@ -136,7 +159,6 @@ def _run_sf(args: list[str], target_org: Optional[str], exit_on_error: bool = Tr
             capture_output=True,
             text=True,
             timeout=300,
-            shell=(sys.platform == "win32"),
         )
     except FileNotFoundError:
         sys.exit(
@@ -166,14 +188,24 @@ def run_tests_in_org(
     target_org: Optional[str],
 ) -> None:
     """Run the given test classes synchronously in the org to populate coverage data."""
+    names = []
+    for name in test_class_names:
+        try:
+            names.append(apex_identifier(name))
+        except ValueError:
+            print(f"[org]    Skipping invalid test class name: {name!r}", file=sys.stderr)
+    if not names:
+        print("[org]    No valid test class names to run.", file=sys.stderr)
+        return
+
     print(
-        f"[org]    Running {len(test_class_names)} test class(es) to generate coverage: "
-        f"{', '.join(test_class_names)}",
+        f"[org]    Running {len(names)} test class(es) to generate coverage: "
+        f"{', '.join(names)}",
         file=sys.stderr,
     )
 
     args = ["apex", "test", "run", "--wait", "10", "--code-coverage"]
-    for name in test_class_names:
+    for name in names:
         args += ["--class-names", name]
 
     # exit_on_error=False: some tests may fail but coverage is still recorded
@@ -196,7 +228,7 @@ def find_by_org_coverage(
     soql = (
         "SELECT ApexTestClass.Name, NumLinesCovered, NumLinesUncovered "
         "FROM ApexCodeCoverage "
-        f"WHERE ApexClassOrTrigger.Name = '{class_name}'"
+        f"WHERE ApexClassOrTrigger.Name = '{apex_identifier(class_name)}'"
     )
 
     print(f"[org]    Querying Tooling API for coverage of '{class_name}'…", file=sys.stderr)
@@ -345,7 +377,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("class_name", help="The Apex class to find test coverage for.")
+    p.add_argument(
+        "class_name",
+        type=apex_identifier,
+        help="The Apex class to find test coverage for.",
+    )
 
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
