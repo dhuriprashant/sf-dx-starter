@@ -26,8 +26,9 @@ Nine classes under `force-app/main/default/classes/`, in three layers:
 ┌──────────────▼──────────────┐  ┌────────────▼───────────────┐
 │  JsonApiService             │  │  JsonApiQueryParams        │  Engine layer
 │   • generic CRUD engine     │  │   • parse/validate         │
-│   • dynamic SOQL + binds    │  │     include/fields/sort/   │
-│   • compound docs (?include)│  │     page/filter            │
+│   • compound docs (?include)│  │     include/fields/sort/   │
+│   • uses JsonApiQuery for   │  │     page/filter            │
+│     SOQL + limit guards     │  │                            │
 └──────────────┬──────────────┘  └────────────────────────────┘
                │ reads config from            │ serializes via
 ┌──────────────▼──────────────────────────────▼───────────────┐
@@ -39,7 +40,8 @@ Nine classes under `force-app/main/default/classes/`, in three layers:
 | Class                       | File                            | Role                                                                                                                                   |
 | --------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `JsonApiRouter`             | `JsonApiRouter.cls`             | `@RestResource(urlMapping='/jsonapi/*')`. HTTP verb handlers, URL routing, header checks, body parsing, error-to-document translation. |
-| `JsonApiService`            | `JsonApiService.cls`            | All business logic: SOQL building, CRUD, relationships, pagination, compound documents. Fully generic — no per-object code.            |
+| `JsonApiService`            | `JsonApiService.cls`            | All business logic: CRUD, relationships, pagination, compound documents. Fully generic — no per-object code.                           |
+| `JsonApiQuery`              | `JsonApiQuery.cls`              | Shared SOQL construction (`selectFrom`, `byId`, `byIds`, `children`) and transaction-limit guards (query-row budget, heap headroom).   |
 | `JsonApiConfig`             | `JsonApiConfig.cls`             | The one file you edit to expose an SObject. Declares resource definitions.                                                             |
 | `JsonApiRegistry`           | `JsonApiRegistry.cls`           | Static in-memory map: resource type name → definition.                                                                                 |
 | `JsonApiResourceDefinition` | `JsonApiResourceDefinition.cls` | Fluent builder mapping JSON attribute names ↔ SObject field API names, plus relationship metadata.                                     |
@@ -221,8 +223,8 @@ The algorithm processes each include path **level by level**: starting from the 
 
 Per segment kind, `expandRelationship` does:
 
-- **to-many**: one bulk query — `queryChildren()` selects the child definition's fields _plus the FK field_, filters `WHERE fk IN :parentIds` — children are grouped by parent ID into `toManyData`. One query per level regardless of how many parents (no N+1).
-- **to-one**: collect the non-null lookup IDs across the parents, one `queryByIds()` bulk fetch. No linkage map needed — the serializer reads the lookup value straight off the parent record.
+- **to-many**: one bulk query — `JsonApiQuery.children()` selects the child definition's fields _plus the FK field_, filters `WHERE fk IN :parentIds` — children are grouped by parent ID into `toManyData`. One query per level regardless of how many parents (no N+1).
+- **to-one**: collect the non-null lookup IDs across the parents, one `JsonApiQuery.byIds()` bulk fetch. No linkage map needed — the serializer reads the lookup value straight off the parent record.
 - **nested** (aliased path): delegated to `traverseNested()` — see §5.5. Its root→final linkage merges into `toManyData` like a to-many segment.
 
 Included resources are serialized with the same `qp`, so `fields[childType]` sparse fieldsets apply to them too (and per the spec, sparse fieldsets are the one thing allowed to drop relationship linkage from included resources).
@@ -232,7 +234,7 @@ Included resources are serialized with the same `qp`, so `fields[childType]` spa
 Implements the spec's "expose a deeply nested relationship under an alternative name" provision (registered via `.nested()`, §3.1) — unlike a dot-path include, an alias deliberately **hides the intermediate resources**. Two helpers:
 
 - **`JsonApiRegistry.resolveNested()`** ([JsonApiRegistry.cls:33-54](../force-app/main/default/classes/JsonApiRegistry.cls#L33-L54)) — validates the path on first use and caches the result on the `Rel`: each segment must be a _direct_ relationship on the type reached by the previous segment (a broken path is a 500 Configuration Error); cardinality resolves to to-many if **any** hop is to-many; `targetType` becomes the final hop's type. Lazy resolution means `JsonApiConfig` registration order doesn't matter. It lives on the registry so both the engine and query-param validation can call it.
-- **`traverseNested()`** ([JsonApiService.cls:330-395](../force-app/main/default/classes/JsonApiService.cls#L330-L395)) — walks the path hop by hop with **one bulk query per hop** (`queryChildren` for to-many hops, `queryByIds` for to-one hops), carrying a `Map<currentRecordId, Set<rootId>>` so fan-out/fan-in linkage stays correct — e.g. two contacts reporting to the same manager collapse to a single linkage entry per root account. It returns a `NestedResult`: the final-hop records, their definition, and `root → identifiers` linkage.
+- **`traverseNested()`** ([JsonApiService.cls:330-395](../force-app/main/default/classes/JsonApiService.cls#L330-L395)) — walks the path hop by hop with **one bulk query per hop** (`JsonApiQuery.children` for to-many hops, `JsonApiQuery.byIds` for to-one hops), carrying a `Map<currentRecordId, Set<rootId>>` so fan-out/fan-in linkage stays correct — e.g. two contacts reporting to the same manager collapse to a single linkage entry per root account. It returns a `NestedResult`: the final-hop records, their definition, and `root → identifiers` linkage.
 
 Only the **final-hop** records are serialized into `included`/`toManyData` — intermediates are queried but never emitted, which is the point of the alias. A nested rel whose hops are all to-one serializes as to-one linkage (single identifier or null) instead of an array. Nested rels are read-only end to end: body writes are rejected in `applyToOneRelationships` (400) and `patchRelationship` refuses them (403).
 
@@ -254,7 +256,7 @@ Shared write plumbing:
 
 ### 5.7 Relationship endpoints
 
-- **`getRelated`** ([JsonApiService.cls:94-132](../force-app/main/default/classes/JsonApiService.cls#L94-L132)) — returns full resource objects: an array (possibly empty) for to-many via `queryChildren`, a single resource or `null` for to-one. Nested rels are served by running `traverseNested` from the single parent record. `requireRel()` 404s on unknown relationship names.
+- **`getRelated`** ([JsonApiService.cls:94-132](../force-app/main/default/classes/JsonApiService.cls#L94-L132)) — returns full resource objects: an array (possibly empty) for to-many via `JsonApiQuery.children`, a single resource or `null` for to-one. Nested rels are served by running `traverseNested` from the single parent record. `requireRel()` 404s on unknown relationship names.
 - **`getRelationship`** ([JsonApiService.cls:136-158](../force-app/main/default/classes/JsonApiService.cls#L136-L158)) — same shape but returns only resource **identifiers** (`{type, id}`), with `self` + `related` links; nested rels return the traversal's linkage.
 - **`patchRelationship`** ([JsonApiService.cls:162-195](../force-app/main/default/classes/JsonApiService.cls#L162-L195)) — direct to-one only: nested rels are read-only (403, checked first since their `isToMany` is null until resolved) and to-many linkage replacement would mean re-parenting arbitrary children (403). Validates the `data` member exists and its `type` matches, then writes the lookup (or null) with a sparse update and responds with the fresh linkage document.
 
@@ -359,8 +361,8 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 - **No include-path depth limit.** Dot-paths of any length are accepted; each segment costs one query, so a hostile deep path costs `pathLength` queries (bounded in practice by exposed relationships and the 100-SOQL governor limit).
 - **Filters are equality/IN only** — no `filter[amount][gte]`-style operators; multiple filters always AND.
 - **Pagination is cursor-only.** `page[number]` is rejected (400); the `page[after]` keyset cursor has unlimited depth but is forward-only, Id-ordered, and not a point-in-time snapshot. Consequently a **sorted page is not walkable**: `sort` + `page[size]` returns the top page with no `next` link, because the cursor cannot resume a custom sort order.
-- **Query-row budget guards are truncation-based.** List, `queryByIds`, and `queryChildren` queries are each capped at the remaining 50k transaction budget and throw a 400 "Result Set Too Large" on hitting the cap — including a result that legitimately fills the budget exactly.
-- **Heap is guarded heuristically.** After each bulk fetch, `checkHeapHeadroom()` throws a 400 "Response Too Large" when `Limits.getHeapSize() * 3 > Limits.getLimitHeapSize()` — the 3× reserves room for the document maps and JSON string that serialization still has to build. The multiplier is an estimate: very wide rows could still blow heap during serialization (uncatchable 500), and a modest overshoot may be rejected that would actually have fit. CPU time is not guarded.
+- **Query-row budget guards are truncation-based.** List, `JsonApiQuery.byIds`, and `JsonApiQuery.children` queries are each capped at the remaining 50k transaction budget and throw a 400 "Result Set Too Large" on hitting the cap — including a result that legitimately fills the budget exactly.
+- **Heap is guarded heuristically.** After each bulk fetch, `JsonApiQuery`'s heap-headroom check throws a 400 "Response Too Large" when `Limits.getHeapSize() * 3 > Limits.getLimitHeapSize()` — the 3× reserves room for the document maps and JSON string that serialization still has to build. The multiplier is an estimate: very wide rows could still blow heap during serialization (uncatchable 500), and a modest overshoot may be rejected that would actually have fit. CPU time is not guarded.
 - **To-many linkage is read-only** (`PATCH /relationships/{toMany}` → 403), and full-replacement POST/DELETE on to-many relationship endpoints isn't implemented.
 - **No client-generated IDs** (403 per the optional part of the spec) and **no atomic multi-operation extension**.
 - **Registrations are code**, not Custom Metadata — exposing an object requires a deploy.

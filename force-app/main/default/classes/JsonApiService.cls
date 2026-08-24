@@ -22,10 +22,7 @@ public with sharing class JsonApiService {
     }
 
     String soql =
-      'SELECT ' +
-      String.join(def.getSelectFields(), ', ') +
-      ' FROM ' +
-      def.sobjectName +
+      JsonApiQuery.selectFrom(def) +
       whereClause +
       buildOrderBy(def, qp);
 
@@ -35,13 +32,7 @@ public with sharing class JsonApiService {
     if (qp.pageSize != null) {
       // No COUNT query: fetch one sentinel row past the page to know whether a
       // next link is due. total stays null — paginated responses carry no totals.
-      if (qp.pageSize + 1 > queryRowBudget()) {
-        throw resultSetTooLarge();
-      }
-      binds.put('jsonApiLimit', qp.pageSize + 1);
-      soql += ' LIMIT :jsonApiLimit';
-      records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
-      checkHeapHeadroom();
+      records = JsonApiQuery.runLimited(soql, binds, qp.pageSize + 1);
       if (records.size() > qp.pageSize) {
         hasNext = true;
         records.remove(qp.pageSize);
@@ -52,24 +43,19 @@ public with sharing class JsonApiService {
         'page[after]'
       );
     } else {
-      // Unpaginated: no COUNT needed — the result itself is the total. Cap at the
-      // remaining query-row budget and treat hitting the cap as truncation.
-      Integer budget = queryRowBudget();
-      binds.put('jsonApiLimit', budget);
-      soql += ' LIMIT :jsonApiLimit';
-      records = Database.queryWithBinds(soql, binds, AccessLevel.USER_MODE);
-      if (records.size() >= budget) {
-        throw resultSetTooLarge();
-      }
-      checkHeapHeadroom();
+      // Unpaginated: no COUNT needed — the result itself is the total, capped at
+      // the remaining query-row budget.
+      records = JsonApiQuery.runCapped(soql, binds);
       total = records.size();
     }
 
     Compound comp = buildCompound(records, def, qp);
-    List<Map<String, Object>> data = new List<Map<String, Object>>();
-    for (SObject rec : records) {
-      data.add(JsonApiSerializer.resource(rec, def, qp, comp.toManyData));
-    }
+    List<Map<String, Object>> data = JsonApiSerializer.resources(
+      records,
+      def,
+      qp,
+      comp.toManyData
+    );
     Id nextCursor = hasNext ? records[records.size() - 1].Id : null;
     return JsonApiSerializer.document(
       data,
@@ -90,9 +76,9 @@ public with sharing class JsonApiService {
     Compound comp = buildCompound(new List<SObject>{ rec }, def, qp);
     return JsonApiSerializer.document(
       JsonApiSerializer.resource(rec, def, qp, comp.toManyData),
-      new Map<String, Object>{
-        'self' => JsonApiSerializer.resourceUrl(def.resourceType, recordId)
-      },
+      JsonApiSerializer.selfLink(
+        JsonApiSerializer.resourceUrl(def.resourceType, recordId)
+      ),
       null,
       comp.included
     );
@@ -165,12 +151,12 @@ public with sharing class JsonApiService {
     if (rel.isNested()) {
       NestedResult nr = traverseNested(def, rel, new List<SObject>{ parent });
       if (rel.isToMany) {
-        List<Map<String, Object>> nestedData = new List<Map<String, Object>>();
-        for (SObject fin : nr.finalsById.values()) {
-          nestedData.add(
-            JsonApiSerializer.resource(fin, nr.finalDef, qp, null)
-          );
-        }
+        List<Map<String, Object>> nestedData = JsonApiSerializer.resources(
+          nr.finalsById.values(),
+          nr.finalDef,
+          qp,
+          null
+        );
         return JsonApiSerializer.document(
           nestedData,
           relatedLinks(def, recordId, relName),
@@ -196,15 +182,17 @@ public with sharing class JsonApiService {
 
     JsonApiResourceDefinition targetDef = JsonApiRegistry.get(rel.targetType);
     if (rel.isToMany) {
-      List<SObject> children = queryChildren(
+      List<SObject> children = JsonApiQuery.children(
         targetDef,
         rel.field,
         new Set<Id>{ recordId }
       );
-      List<Map<String, Object>> data = new List<Map<String, Object>>();
-      for (SObject child : children) {
-        data.add(JsonApiSerializer.resource(child, targetDef, qp, null));
-      }
+      List<Map<String, Object>> data = JsonApiSerializer.resources(
+        children,
+        targetDef,
+        qp,
+        null
+      );
       return JsonApiSerializer.document(
         data,
         relatedLinks(def, recordId, relName),
@@ -251,7 +239,7 @@ public with sharing class JsonApiService {
       JsonApiResourceDefinition targetDef = JsonApiRegistry.get(rel.targetType);
       List<Map<String, Object>> identifiers = new List<Map<String, Object>>();
       for (
-        SObject child : queryChildren(
+        SObject child : JsonApiQuery.children(
           targetDef,
           rel.field,
           new Set<Id>{ recordId }
@@ -300,19 +288,8 @@ public with sharing class JsonApiService {
         .withPointer('/data');
     }
     fetchById(def, recordId);
-    Object linkage = body.get('data');
-    Id targetId = null;
-    if (linkage != null) {
-      Map<String, Object> identifier = (Map<String, Object>) linkage;
-      if ((String) identifier.get('type') != rel.targetType) {
-        throw JsonApiException.conflict(
-          'Expected resource identifier of type "' + rel.targetType + '".'
-        );
-      }
-      targetId = Id.valueOf((String) identifier.get('id'));
-    }
     SObject rec = def.getSObjectType().newSObject(recordId);
-    rec.put(rel.field, targetId);
+    rec.put(rel.field, linkageTargetId(rel, body.get('data'), '/data'));
     Database.update(rec, AccessLevel.USER_MODE);
     return getRelationship(def, recordId, relName);
   }
@@ -415,13 +392,15 @@ public with sharing class JsonApiService {
     if (rel.isToMany) {
       Set<Id> parentIds = new Map<Id, SObject>(parents.records).keySet();
       Map<Id, List<Map<String, Object>>> linkage = new Map<Id, List<Map<String, Object>>>();
-      for (SObject child : queryChildren(targetDef, rel.field, parentIds)) {
+      for (
+        SObject child : JsonApiQuery.children(targetDef, rel.field, parentIds)
+      ) {
         Id parentId = (Id) child.get(rel.field);
-        if (!linkage.containsKey(parentId)) {
-          linkage.put(parentId, new List<Map<String, Object>>());
-        }
-        linkage.get(parentId)
-          .add(JsonApiSerializer.identifier(rel.targetType, child.Id));
+        addIdentifier(
+          linkage,
+          parentId,
+          JsonApiSerializer.identifier(rel.targetType, child.Id)
+        );
         next.records.add(child);
       }
       mergeLinkage(comp, rel.name, linkage);
@@ -435,7 +414,7 @@ public with sharing class JsonApiService {
         }
       }
       if (!targetIds.isEmpty()) {
-        next.records = queryByIds(targetDef, targetIds);
+        next.records = JsonApiQuery.byIds(targetDef, targetIds);
       }
     }
     return next;
@@ -485,7 +464,7 @@ public with sharing class JsonApiService {
       if (!current.isEmpty()) {
         if (hop.isToMany) {
           for (
-            SObject child : queryChildren(
+            SObject child : JsonApiQuery.children(
               targetDef,
               hop.field,
               current.keySet()
@@ -493,10 +472,7 @@ public with sharing class JsonApiService {
           ) {
             Id parentId = (Id) child.get(hop.field);
             next.put(child.Id, child);
-            if (!nextRootsOf.containsKey(child.Id)) {
-              nextRootsOf.put(child.Id, new Set<Id>());
-            }
-            nextRootsOf.get(child.Id).addAll(rootsOf.get(parentId));
+            addRoots(nextRootsOf, child.Id, rootsOf.get(parentId));
           }
         } else {
           Map<Id, Set<Id>> wanted = new Map<Id, Set<Id>>(); // target Id -> root Ids
@@ -505,13 +481,12 @@ public with sharing class JsonApiService {
             if (targetId == null) {
               continue;
             }
-            if (!wanted.containsKey(targetId)) {
-              wanted.put(targetId, new Set<Id>());
-            }
-            wanted.get(targetId).addAll(rootsOf.get(rec.Id));
+            addRoots(wanted, targetId, rootsOf.get(rec.Id));
           }
           if (!wanted.isEmpty()) {
-            for (SObject target : queryByIds(targetDef, wanted.keySet())) {
+            for (
+              SObject target : JsonApiQuery.byIds(targetDef, wanted.keySet())
+            ) {
               next.put(target.Id, target);
               nextRootsOf.put(target.Id, wanted.get(target.Id));
             }
@@ -528,85 +503,48 @@ public with sharing class JsonApiService {
     result.finalsById = current;
     for (Id finalId : current.keySet()) {
       for (Id rootId : rootsOf.get(finalId)) {
-        if (!result.linkage.containsKey(rootId)) {
-          result.linkage.put(rootId, new List<Map<String, Object>>());
-        }
-        result.linkage.get(rootId)
-          .add(JsonApiSerializer.identifier(currentDef.resourceType, finalId));
+        addIdentifier(
+          result.linkage,
+          rootId,
+          JsonApiSerializer.identifier(currentDef.resourceType, finalId)
+        );
       }
     }
     return result;
   }
 
+  /** Append an identifier to a key's linkage list, creating the list on first use. */
+  private static void addIdentifier(
+    Map<Id, List<Map<String, Object>>> linkage,
+    Id key,
+    Map<String, Object> identifier
+  ) {
+    if (!linkage.containsKey(key)) {
+      linkage.put(key, new List<Map<String, Object>>());
+    }
+    linkage.get(key).add(identifier);
+  }
+
+  /** Record that a set of root Ids reaches a record, creating the set on first use. */
+  private static void addRoots(
+    Map<Id, Set<Id>> rootsByRecord,
+    Id key,
+    Set<Id> rootIds
+  ) {
+    if (!rootsByRecord.containsKey(key)) {
+      rootsByRecord.put(key, new Set<Id>());
+    }
+    rootsByRecord.get(key).addAll(rootIds);
+  }
+
   private static SObject fetchById(JsonApiResourceDefinition def, Id recordId) {
-    Map<String, Object> binds = new Map<String, Object>{
-      'jsonApiId' => recordId
-    };
-    List<SObject> recs = Database.queryWithBinds(
-      'SELECT ' +
-        String.join(def.getSelectFields(), ', ') +
-        ' FROM ' +
-        def.sobjectName +
-        ' WHERE Id = :jsonApiId',
-      binds,
-      AccessLevel.USER_MODE
-    );
+    List<SObject> recs = JsonApiQuery.byId(def, recordId);
     if (recs.isEmpty()) {
       throw JsonApiException.notFound(
         'No ' + def.resourceType + ' resource with id ' + recordId
       );
     }
     return recs[0];
-  }
-
-  private static List<SObject> queryByIds(
-    JsonApiResourceDefinition def,
-    Set<Id> ids
-  ) {
-    Integer budget = queryRowBudget();
-    List<SObject> recs = Database.queryWithBinds(
-      'SELECT ' +
-        String.join(def.getSelectFields(), ', ') +
-        ' FROM ' +
-        def.sobjectName +
-        ' WHERE Id IN :jsonApiIds LIMIT :jsonApiBudget',
-      new Map<String, Object>{ 'jsonApiIds' => ids, 'jsonApiBudget' => budget },
-      AccessLevel.USER_MODE
-    );
-    if (recs.size() >= budget) {
-      throw resultSetTooLarge();
-    }
-    checkHeapHeadroom();
-    return recs;
-  }
-
-  private static List<SObject> queryChildren(
-    JsonApiResourceDefinition childDef,
-    String fkField,
-    Set<Id> parentIds
-  ) {
-    Set<String> fields = new Set<String>(childDef.getSelectFields());
-    fields.add(fkField);
-    Integer budget = queryRowBudget();
-    List<SObject> recs = Database.queryWithBinds(
-      'SELECT ' +
-        String.join(new List<String>(fields), ', ') +
-        ' FROM ' +
-        childDef.sobjectName +
-        ' WHERE ' +
-        fkField +
-        ' IN :jsonApiParentIds LIMIT :jsonApiBudget',
-      new Map<String, Object>{
-        'jsonApiParentIds' => parentIds,
-        'jsonApiBudget' => budget
-      },
-      AccessLevel.USER_MODE
-    );
-    if (recs.size() >= budget) {
-      throw resultSetTooLarge();
-    }
-    checkHeapHeadroom();
-    return recs;
   }
 
   private static String buildWhere(
@@ -625,7 +563,7 @@ public with sharing class JsonApiService {
       String bindName = 'jsonApiFilter' + i;
       binds.put(
         bindName,
-        typedFilterValues(fd, qp.filters.get(attr).split(','))
+        typedFilterValues(fd, JsonApiQueryParams.splitCsv(qp.filters.get(attr)))
       );
       clauses.add(fieldName + ' IN :' + bindName);
       i++;
@@ -642,14 +580,14 @@ public with sharing class JsonApiService {
       when DATE {
         List<Date> vals = new List<Date>();
         for (String raw : raws) {
-          vals.add((Date) coerce(fd, raw.trim()));
+          vals.add((Date) coerce(fd, raw));
         }
         return vals;
       }
       when DATETIME {
         List<Datetime> vals = new List<Datetime>();
         for (String raw : raws) {
-          vals.add((Datetime) coerce(fd, raw.trim()));
+          vals.add((Datetime) coerce(fd, raw));
         }
         return vals;
       }
@@ -657,10 +595,10 @@ public with sharing class JsonApiService {
         List<Decimal> vals = new List<Decimal>();
         for (String raw : raws) {
           try {
-            vals.add(Decimal.valueOf(raw.trim()));
+            vals.add(Decimal.valueOf(raw));
           } catch (Exception e) {
             throw JsonApiException.badRequest(
-              'Invalid numeric filter value: ' + raw.trim()
+              'Invalid numeric filter value: ' + raw
             );
           }
         }
@@ -669,16 +607,12 @@ public with sharing class JsonApiService {
       when BOOLEAN {
         List<Boolean> vals = new List<Boolean>();
         for (String raw : raws) {
-          vals.add((Boolean) coerce(fd, raw.trim()));
+          vals.add((Boolean) coerce(fd, raw));
         }
         return vals;
       }
       when else {
-        List<String> vals = new List<String>();
-        for (String raw : raws) {
-          vals.add(raw.trim());
-        }
-        return vals;
+        return raws;
       }
     }
   }
@@ -700,42 +634,6 @@ public with sharing class JsonApiService {
     return ' ORDER BY ' + String.join(parts, ', ');
   }
 
-  private static Integer remainingQueryRows() {
-    return Limits.getLimitQueryRows() - Limits.getQueryRows();
-  }
-
-  /** Remaining query-row budget; throws if already exhausted. */
-  private static Integer queryRowBudget() {
-    Integer budget = remainingQueryRows();
-    if (budget <= 0) {
-      throw resultSetTooLarge();
-    }
-    return budget;
-  }
-
-  private static JsonApiException resultSetTooLarge() {
-    return JsonApiException.of(
-      400,
-      'Result Set Too Large',
-      'Matching records exceed the transaction query row limit; narrow the result with filter[...], request a smaller page[size], or reduce ?include.'
-    );
-  }
-
-  /**
-   * Serializing roughly triples the records' footprint (SObjects, document maps,
-   * JSON string), so require that headroom now and fail with a clean 400 while
-   * the error document can still be built — a heap LimitException is uncatchable.
-   */
-  private static void checkHeapHeadroom() {
-    if (Limits.getHeapSize() * 3 > Limits.getLimitHeapSize()) {
-      throw JsonApiException.of(
-        400,
-        'Response Too Large',
-        'The response would exceed the transaction heap limit; narrow the result with filter[...], request a smaller page[size], or reduce ?include.'
-      );
-    }
-  }
-
   private static Map<String, Object> pageLinks(
     JsonApiResourceDefinition def,
     JsonApiQueryParams qp,
@@ -743,16 +641,12 @@ public with sharing class JsonApiService {
     Id nextCursor
   ) {
     if (qp.pageSize == null) {
-      return new Map<String, Object>{
-        'self' => JsonApiSerializer.baseUrl() +
-        '/' +
-        def.resourceType
-      };
+      return JsonApiSerializer.selfLink(
+        JsonApiSerializer.collectionUrl(def.resourceType)
+      );
     }
     String base =
-      JsonApiSerializer.baseUrl() +
-      '/' +
-      def.resourceType +
+      JsonApiSerializer.collectionUrl(def.resourceType) +
       '?page%5Bsize%5D=' +
       qp.pageSize;
     Map<String, Object> links = new Map<String, Object>{
@@ -782,11 +676,7 @@ public with sharing class JsonApiService {
     Id recordId,
     String relName
   ) {
-    return new Map<String, Object>{
-      'self' => JsonApiSerializer.resourceUrl(def.resourceType, recordId) +
-      '/' +
-      relName
-    };
+    return JsonApiSerializer.relatedLinks(def.resourceType, recordId, relName);
   }
 
   private static Map<String, Object> relationshipLinks(
@@ -794,15 +684,11 @@ public with sharing class JsonApiService {
     Id recordId,
     String relName
   ) {
-    String resUrl = JsonApiSerializer.resourceUrl(def.resourceType, recordId);
-    return new Map<String, Object>{
-      'self' => resUrl +
-      '/relationships/' +
-      relName,
-      'related' => resUrl +
-      '/' +
+    return JsonApiSerializer.relationshipLinks(
+      def.resourceType,
+      recordId,
       relName
-    };
+    );
   }
 
   private static JsonApiResourceDefinition.Rel requireRel(
@@ -881,23 +767,38 @@ public with sharing class JsonApiService {
       }
       Map<String, Object> relObj = (Map<String, Object>) rels.get(relName);
       Object linkage = relObj == null ? null : relObj.get('data');
-      if (linkage == null) {
-        rec.put(rel.field, null);
-      } else {
-        Map<String, Object> identifier = (Map<String, Object>) linkage;
-        if ((String) identifier.get('type') != rel.targetType) {
-          throw JsonApiException.conflict(
-              'Relationship "' +
-                relName +
-                '" expects type "' +
-                rel.targetType +
-                '".'
-            )
-            .withPointer('/data/relationships/' + relName + '/data/type');
-        }
-        rec.put(rel.field, Id.valueOf((String) identifier.get('id')));
-      }
+      rec.put(
+        rel.field,
+        linkageTargetId(
+          rel,
+          linkage,
+          '/data/relationships/' + relName + '/data'
+        )
+      );
     }
+  }
+
+  /** Target Id of a to-one relationship linkage object; null linkage clears the lookup. */
+  private static Id linkageTargetId(
+    JsonApiResourceDefinition.Rel rel,
+    Object linkage,
+    String pointer
+  ) {
+    if (linkage == null) {
+      return null;
+    }
+    Map<String, Object> identifier = (Map<String, Object>) linkage;
+    if ((String) identifier.get('type') != rel.targetType) {
+      throw JsonApiException.conflict(
+          'Relationship "' +
+            rel.name +
+            '" expects type "' +
+            rel.targetType +
+            '".'
+        )
+        .withPointer(pointer + '/type');
+    }
+    return Id.valueOf((String) identifier.get('id'));
   }
 
   private static Schema.DescribeFieldResult describeField(

@@ -45,22 +45,13 @@ global with sharing class JsonApiRouter {
       checkHeaders(req, method);
       route(method, req, res);
     } catch (JsonApiException e) {
-      writeErrors(
-        res,
-        e.status,
-        new List<JsonApiError>{ JsonApiError.fromException(e) }
-      );
+      writeError(res, e.status, JsonApiError.fromException(e));
     } catch (System.QueryException e) {
-      writeErrors(res, 400, new List<JsonApiError>{ JsonApiError.internal(e) });
+      writeError(res, 400, JsonApiError.internal(e));
     } catch (System.DmlException e) {
-      JsonApiError err = new JsonApiError();
-      err.status = '422';
-      err.title = 'Unprocessable Content';
-      err.detail = e.getDmlMessage(0);
-      err.code = String.valueOf(e.getDmlType(0));
-      writeErrors(res, 422, new List<JsonApiError>{ err });
+      writeError(res, 422, JsonApiError.fromDml(e));
     } catch (Exception e) {
-      writeErrors(res, 500, new List<JsonApiError>{ JsonApiError.internal(e) });
+      writeError(res, 500, JsonApiError.internal(e));
     }
   }
 
@@ -78,7 +69,7 @@ global with sharing class JsonApiRouter {
         200,
         JsonApiSerializer.document(
           null,
-          new Map<String, Object>{ 'self' => JsonApiSerializer.baseUrl() },
+          JsonApiSerializer.selfLink(JsonApiSerializer.baseUrl()),
           new Map<String, Object>{
             'resourceTypes' => new List<String>(
               JsonApiRegistry.registeredTypes()
@@ -252,14 +243,15 @@ global with sharing class JsonApiRouter {
     res.responseBody = Blob.valueOf(JSON.serialize(doc));
   }
 
-  private static void writeErrors(
+  private static void writeError(
     RestResponse res,
     Integer status,
-    List<JsonApiError> errors
+    JsonApiError err
   ) {
-    res.statusCode = status;
-    res.responseBody = Blob.valueOf(
-      JSON.serialize(JsonApiSerializer.errorDocument(errors))
+    writeDocument(
+      res,
+      status,
+      JsonApiSerializer.errorDocument(new List<JsonApiError>{ err })
     );
   }
 }

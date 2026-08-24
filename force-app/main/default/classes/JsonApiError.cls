@@ -28,6 +28,16 @@ public class JsonApiError {
     return err;
   }
 
+  /** First DML failure of a save, rendered as an unprocessable-content error. */
+  public static JsonApiError fromDml(System.DmlException ex) {
+    JsonApiError err = new JsonApiError();
+    err.status = '422';
+    err.title = 'Unprocessable Content';
+    err.detail = ex.getDmlMessage(0);
+    err.code = String.valueOf(ex.getDmlType(0));
+    return err;
+  }
+
   public Map<String, Object> toMap() {
     Map<String, Object> m = new Map<String, Object>{
       'status' => status,

@@ -24,9 +24,10 @@ public class JsonApiQueryParams {
     }
     for (String key : params.keySet()) {
       String value = params.get(key);
+      String fieldsType = bracketArg(key, 'fields');
+      String filterAttr = bracketArg(key, 'filter');
       if (key == 'include') {
-        for (String inc : value.split(',')) {
-          String path = inc.trim();
+        for (String path : splitCsv(value)) {
           // dot-paths: each segment must be a relationship on the type reached by the previous one
           JsonApiResourceDefinition currentDef = def;
           for (String seg : path.split('\\.')) {
@@ -44,17 +45,11 @@ public class JsonApiQueryParams {
           }
           qp.include.add(path);
         }
-      } else if (key.startsWith('fields[') && key.endsWith(']')) {
-        String resType = key.substring(7, key.length() - 1);
-        Set<String> allowed = new Set<String>();
-        for (String f : value.split(',')) {
-          allowed.add(f.trim());
-        }
-        qp.sparseFields.put(resType, allowed);
+      } else if (fieldsType != null) {
+        qp.sparseFields.put(fieldsType, new Set<String>(splitCsv(value)));
       } else if (key == 'sort') {
-        for (String s : value.split(',')) {
+        for (String name : splitCsv(value)) {
           SortField sf = new SortField();
-          String name = s.trim();
           sf.descending = name.startsWith('-');
           sf.attribute = sf.descending ? name.substring(1) : name;
           if (def.fieldFor(sf.attribute) == null) {
@@ -87,15 +82,14 @@ public class JsonApiQueryParams {
             'page[after]'
           );
         }
-      } else if (key.startsWith('filter[') && key.endsWith(']')) {
-        String attr = key.substring(7, key.length() - 1);
-        if (def.fieldFor(attr) == null) {
+      } else if (filterAttr != null) {
+        if (def.fieldFor(filterAttr) == null) {
           throw JsonApiException.badParameter(
-            'Cannot filter by unknown attribute: ' + attr,
+            'Cannot filter by unknown attribute: ' + filterAttr,
             key
           );
         }
-        qp.filters.put(attr, value);
+        qp.filters.put(filterAttr, value);
       }
     }
     if (qp.after != null) {
@@ -117,6 +111,23 @@ public class JsonApiQueryParams {
 
   public Set<String> sparseFor(String resourceType) {
     return sparseFields.get(resourceType);
+  }
+
+  /** Split a comma-separated parameter value into trimmed parts. */
+  public static List<String> splitCsv(String value) {
+    List<String> parts = new List<String>();
+    for (String part : value.split(',')) {
+      parts.add(part.trim());
+    }
+    return parts;
+  }
+
+  /** Argument of a bracketed key, e.g. 'accounts' from 'fields[accounts]'; null if the key does not match. */
+  private static String bracketArg(String key, String param) {
+    if (!key.startsWith(param + '[') || !key.endsWith(']')) {
+      return null;
+    }
+    return key.substring(param.length() + 1, key.length() - 1);
   }
 
   private static Integer toPositiveInt(String value, String param) {

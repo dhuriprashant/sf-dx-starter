@@ -8,8 +8,42 @@ public class JsonApiSerializer {
       '/services/apexrest/jsonapi';
   }
 
+  public static String collectionUrl(String resourceType) {
+    return baseUrl() + '/' + resourceType;
+  }
+
   public static String resourceUrl(String resourceType, Id recordId) {
-    return baseUrl() + '/' + resourceType + '/' + recordId;
+    return collectionUrl(resourceType) + '/' + recordId;
+  }
+
+  public static Map<String, Object> selfLink(String url) {
+    return new Map<String, Object>{ 'self' => url };
+  }
+
+  /** Links of a related-resource endpoint: /{type}/{id}/{rel}. */
+  public static Map<String, Object> relatedLinks(
+    String resourceType,
+    Id recordId,
+    String relName
+  ) {
+    return selfLink(resourceUrl(resourceType, recordId) + '/' + relName);
+  }
+
+  /** Links of a relationship object: its own linkage endpoint plus the related-resource endpoint. */
+  public static Map<String, Object> relationshipLinks(
+    String resourceType,
+    Id recordId,
+    String relName
+  ) {
+    String resUrl = resourceUrl(resourceType, recordId);
+    return new Map<String, Object>{
+      'self' => resUrl +
+      '/relationships/' +
+      relName,
+      'related' => resUrl +
+      '/' +
+      relName
+    };
   }
 
   /**
@@ -39,14 +73,7 @@ public class JsonApiSerializer {
       }
       JsonApiResourceDefinition.Rel rel = def.relationships.get(relName);
       Map<String, Object> relObj = new Map<String, Object>{
-        'links' => new Map<String, Object>{
-          'self' => resourceUrl(def.resourceType, rec.Id) +
-          '/relationships/' +
-          relName,
-          'related' => resourceUrl(def.resourceType, rec.Id) +
-          '/' +
-          relName
-        }
+        'links' => relationshipLinks(def.resourceType, rec.Id, relName)
       };
       if (!rel.isNested() && !rel.isToMany) {
         Id targetId = (Id) rec.get(rel.field);
@@ -74,14 +101,26 @@ public class JsonApiSerializer {
       'type' => def.resourceType,
       'id' => String.valueOf(rec.Id),
       'attributes' => attrs,
-      'links' => new Map<String, Object>{
-        'self' => resourceUrl(def.resourceType, rec.Id)
-      }
+      'links' => selfLink(resourceUrl(def.resourceType, rec.Id))
     };
     if (!rels.isEmpty()) {
       res.put('relationships', rels);
     }
     return res;
+  }
+
+  /** Serialize a batch of records of the same type. */
+  public static List<Map<String, Object>> resources(
+    List<SObject> records,
+    JsonApiResourceDefinition def,
+    JsonApiQueryParams qp,
+    Map<String, Map<Id, List<Map<String, Object>>>> toManyData
+  ) {
+    List<Map<String, Object>> data = new List<Map<String, Object>>();
+    for (SObject rec : records) {
+      data.add(resource(rec, def, qp, toManyData));
+    }
+    return data;
   }
 
   public static Map<String, Object> identifier(
@@ -101,10 +140,8 @@ public class JsonApiSerializer {
     Map<String, Object> meta,
     List<Map<String, Object>> included
   ) {
-    Map<String, Object> doc = new Map<String, Object>{
-      'jsonapi' => new Map<String, Object>{ 'version' => '1.1' },
-      'data' => data
-    };
+    Map<String, Object> doc = envelope();
+    doc.put('data', data);
     if (links != null && !links.isEmpty()) {
       doc.put('links', links);
     }
@@ -123,9 +160,15 @@ public class JsonApiSerializer {
     for (JsonApiError e : errors) {
       errList.add(e.toMap());
     }
+    Map<String, Object> doc = envelope();
+    doc.put('errors', errList);
+    return doc;
+  }
+
+  /** Top-level members every document carries. */
+  private static Map<String, Object> envelope() {
     return new Map<String, Object>{
-      'jsonapi' => new Map<String, Object>{ 'version' => '1.1' },
-      'errors' => errList
+      'jsonapi' => new Map<String, Object>{ 'version' => '1.1' }
     };
   }
 }
