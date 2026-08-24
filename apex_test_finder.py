@@ -18,17 +18,39 @@ Usage
   python apex_test_finder.py MyApexClass --project-dir ./force-app
   python apex_test_finder.py MyApexClass --org --target-org myAlias
   python apex_test_finder.py MyApexClass --json
+
+Exit codes
+----------
+  0  Completed successfully (even when no test classes were found).
+  1  At least one mode failed; any results printed are partial.
 """
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# Exit codes
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_INTERRUPTED = 130
+
+
+class ApexTestFinderError(Exception):
+    """Base class for expected, reportable failures."""
+
+
+class StaticAnalysisError(ApexTestFinderError):
+    """Raised when the local source tree cannot be analysed."""
+
+
+class SfCliError(ApexTestFinderError):
+    """Raised when the `sf` CLI is unavailable, fails, or returns unusable output."""
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +100,23 @@ def _references_class(content: str, class_name: str) -> bool:
     return bool(pattern.search(content))
 
 
+_CLASS_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
+
+
+def validate_class_name(class_name: str) -> None:
+    """
+    Reject names that are not valid Apex identifiers.
+
+    Besides catching typos early, this keeps the value safe to interpolate into
+    the SOQL query built by find_by_org_coverage.
+    """
+    if not _CLASS_NAME_RE.match(class_name):
+        raise ApexTestFinderError(
+            f"'{class_name}' is not a valid Apex class name (letters, digits and "
+            "underscores only, starting with a letter)."
+        )
+
+
 def find_by_static_analysis(
     class_name: str,
     project_dir: Path,
@@ -85,19 +124,33 @@ def find_by_static_analysis(
     """
     Walk the project directory, collect all .cls files marked @isTest that
     reference class_name.
+
+    Raises StaticAnalysisError if the project directory cannot be scanned at all.
     """
+    validate_class_name(class_name)
+
+    if not project_dir.is_dir():
+        raise StaticAnalysisError(f"Project directory does not exist: {project_dir}")
+
     results: list[TestClassResult] = []
 
-    cls_files = list(project_dir.rglob("*.cls"))
+    try:
+        cls_files = list(project_dir.rglob("*.cls"))
+    except OSError as exc:
+        raise StaticAnalysisError(f"Could not scan {project_dir}: {exc}") from exc
+
     if not cls_files:
         print(f"[static] No .cls files found under {project_dir}", file=sys.stderr)
         return results
+
+    unreadable: list[str] = []
 
     for cls_file in cls_files:
         try:
             content = cls_file.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            print(f"[static] Could not read {cls_file}: {exc}", file=sys.stderr)
+            unreadable.append(f"{cls_file}: {exc}")
+            print(f"[static] WARNING: could not read {cls_file}: {exc}", file=sys.stderr)
             continue
 
         if not _is_test_class(content):
@@ -117,6 +170,18 @@ def find_by_static_analysis(
                 )
             )
 
+    if unreadable and len(unreadable) == len(cls_files):
+        raise StaticAnalysisError(
+            f"None of the {len(cls_files)} .cls file(s) under {project_dir} could be "
+            f"read; first failure: {unreadable[0]}"
+        )
+    if unreadable:
+        print(
+            f"[static] WARNING: skipped {len(unreadable)} of {len(cls_files)} .cls file(s) "
+            "that could not be read; results may be incomplete.",
+            file=sys.stderr,
+        )
+
     return results
 
 
@@ -124,8 +189,18 @@ def find_by_static_analysis(
 # Org query via Salesforce CLI
 # ---------------------------------------------------------------------------
 
-def _run_sf(args: list[str], target_org: Optional[str], exit_on_error: bool = True) -> dict:
-    """Run `sf <args> --json` and return parsed JSON output."""
+SF_TIMEOUT_SECONDS = 300
+
+
+def _run_sf(args: list[str], target_org: Optional[str], raise_on_error: bool = True) -> dict:
+    """
+    Run `sf <args> --json` and return the parsed JSON output.
+
+    Raises SfCliError when the CLI is missing, times out, or emits output that
+    cannot be parsed. When raise_on_error is True a non-zero CLI status is also
+    raised; otherwise the payload is returned so the caller can inspect it (a
+    failed status is still logged, never swallowed).
+    """
     cmd = ["sf"] + args + ["--json"]
     if target_org:
         cmd += ["--target-org", target_org]
@@ -135,28 +210,36 @@ def _run_sf(args: list[str], target_org: Optional[str], exit_on_error: bool = Tr
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=SF_TIMEOUT_SECONDS,
             shell=(sys.platform == "win32"),
         )
-    except FileNotFoundError:
-        sys.exit(
-            "[org] ERROR: `sf` CLI not found. Install Salesforce CLI: "
+    except FileNotFoundError as exc:
+        raise SfCliError(
+            "`sf` CLI not found. Install Salesforce CLI: "
             "https://developer.salesforce.com/tools/salesforcecli"
-        )
-    except subprocess.TimeoutExpired:
-        sys.exit("[org] ERROR: sf CLI timed out after 300 s.")
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SfCliError(f"sf CLI timed out after {SF_TIMEOUT_SECONDS} s: {' '.join(cmd)}") from exc
+    except OSError as exc:
+        raise SfCliError(f"Could not execute sf CLI: {exc}") from exc
 
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        sys.exit(
-            f"[org] ERROR: Could not parse sf output.\n"
+    except json.JSONDecodeError as exc:
+        raise SfCliError(
+            f"Could not parse sf output (exit code {proc.returncode}): {exc}\n"
             f"STDOUT: {proc.stdout[:500]}\nSTDERR: {proc.stderr[:500]}"
-        )
+        ) from exc
 
-    if exit_on_error and data.get("status", 0) != 0:
-        msg = data.get("message") or proc.stderr or "unknown error"
-        sys.exit(f"[org] ERROR from sf CLI: {msg}")
+    if not isinstance(data, dict):
+        raise SfCliError(f"Unexpected sf output, expected a JSON object: {proc.stdout[:500]}")
+
+    status = data.get("status", 0)
+    if status != 0:
+        msg = data.get("message") or proc.stderr.strip() or "unknown error"
+        if raise_on_error:
+            raise SfCliError(f"sf CLI failed (status {status}): {msg}")
+        print(f"[org]    WARNING: sf CLI reported status {status}: {msg}", file=sys.stderr)
 
     return data
 
@@ -165,7 +248,13 @@ def run_tests_in_org(
     test_class_names: list[str],
     target_org: Optional[str],
 ) -> None:
-    """Run the given test classes synchronously in the org to populate coverage data."""
+    """
+    Run the given test classes synchronously in the org to populate coverage data.
+
+    Test failures are reported but not fatal — coverage is still recorded for the
+    lines they executed. A CLI-level failure (bad auth, unknown class, …) raises
+    SfCliError.
+    """
     print(
         f"[org]    Running {len(test_class_names)} test class(es) to generate coverage: "
         f"{', '.join(test_class_names)}",
@@ -176,13 +265,32 @@ def run_tests_in_org(
     for name in test_class_names:
         args += ["--class-names", name]
 
-    # exit_on_error=False: some tests may fail but coverage is still recorded
-    data = _run_sf(args, target_org, exit_on_error=False)
+    # raise_on_error=False: individual test failures still produce coverage data,
+    # so inspect the payload instead of aborting on a non-zero CLI status.
+    data = _run_sf(args, target_org, raise_on_error=False)
 
-    summary = data.get("result", {}).get("summary", {})
+    result = data.get("result") or {}
+    summary = result.get("summary") or {}
     passed = summary.get("passing", 0) or 0
     failed = summary.get("failing", 0) or 0
+
+    if not summary:
+        # A non-zero status with no summary means the run never started (auth
+        # failure, unknown class, …) — that must not look like "0 tests failed".
+        raise SfCliError(
+            "Test run produced no summary; coverage was not generated. "
+            f"sf response: {json.dumps(data)[:500]}"
+        )
+
     print(f"[org]    Test run complete — {passed} passed, {failed} failed.", file=sys.stderr)
+
+    for failure in result.get("tests") or []:
+        if (failure.get("Outcome") or "").lower() == "fail":
+            print(
+                f"[org]    FAILED {failure.get('FullName', '<unknown>')}: "
+                f"{failure.get('Message') or 'no message'}",
+                file=sys.stderr,
+            )
 
 
 def find_by_org_coverage(
@@ -192,7 +300,11 @@ def find_by_org_coverage(
     """
     Query ApexCodeCoverageAggregate via the Tooling API to find test classes
     that produced coverage for class_name.
+
+    Raises SfCliError if the query cannot be run.
     """
+    validate_class_name(class_name)
+
     soql = (
         "SELECT ApexTestClass.Name, NumLinesCovered, NumLinesUncovered "
         "FROM ApexCodeCoverage "
@@ -206,10 +318,10 @@ def find_by_org_coverage(
         target_org,
     )
 
-    records = data.get("result", {}).get("records", [])
+    records = (data.get("result") or {}).get("records") or []
     if not records:
         print(
-            f"[org]    No coverage records found. Have tests been run in this org?",
+            "[org]    No coverage records found. Have tests been run in this org?",
             file=sys.stderr,
         )
         return []
@@ -218,7 +330,14 @@ def find_by_org_coverage(
     totals: dict[str, list[int]] = {}  # name -> [covered, uncovered]
     for rec in records:
         test_class = rec.get("ApexTestClass") or {}
-        name = test_class.get("Name", "<unknown>")
+        name = test_class.get("Name")
+        if not name:
+            print(
+                f"[org]    WARNING: skipping coverage record without a test class name: "
+                f"{json.dumps(rec)[:200]}",
+                file=sys.stderr,
+            )
+            continue
         covered = rec.get("NumLinesCovered", 0) or 0
         uncovered = rec.get("NumLinesUncovered", 0) or 0
         if name in totals:
@@ -256,7 +375,6 @@ def merge_results(
     Combine results from both sources. Where both found the same class,
     keep the org record (has coverage numbers) and annotate source as "both".
     """
-    org_names = {r.name.lower(): r for r in org}
     merged: list[TestClassResult] = []
 
     seen: set[str] = set()
@@ -315,10 +433,15 @@ def print_table(class_name: str, results: list[TestClassResult]) -> None:
     print()
 
 
-def print_json(class_name: str, results: list[TestClassResult]) -> None:
+def print_json(
+    class_name: str,
+    results: list[TestClassResult],
+    errors: Optional[list[str]] = None,
+) -> None:
     output = {
         "targetClass": class_name,
         "count": len(results),
+        "errors": errors or [],
         "testClasses": [
             {
                 "name": r.name,
@@ -378,9 +501,55 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> None:
+def _collect_org_results(
+    class_name: str,
+    project_dir: Path,
+    target_org: Optional[str],
+    static_results: list[TestClassResult],
+    static_available: bool,
+) -> list[TestClassResult]:
+    """Query org coverage, running the statically discovered tests if needed."""
+    org_results = find_by_org_coverage(class_name, target_org)
+    print(f"[org]    Found {len(org_results)} coverage record(s).", file=sys.stderr)
+    if org_results:
+        return org_results
+
+    # No stored coverage — find test candidates via static analysis and run them
+    if static_results:
+        candidates = static_results
+    elif static_available:
+        candidates = find_by_static_analysis(class_name, project_dir)
+    else:
+        print(
+            "[org]    Static analysis is unavailable — cannot auto-run tests to "
+            "generate coverage.",
+            file=sys.stderr,
+        )
+        return org_results
+
+    if not candidates:
+        print(
+            "[org]    No test candidates found by static analysis — cannot auto-run tests.",
+            file=sys.stderr,
+        )
+        return org_results
+
+    run_tests_in_org([r.name for r in candidates], target_org)
+    org_results = find_by_org_coverage(class_name, target_org)
+    print(f"[org]    Found {len(org_results)} coverage record(s) after test run.", file=sys.stderr)
+    return org_results
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """
+    Run the finder and return a process exit code.
+
+    Failures in one mode never discard the other mode's results: when both modes
+    are active the error is reported and the run continues, but the exit code is
+    non-zero so callers can tell the output is partial.
+    """
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     class_name: str = args.class_name
     project_dir: Path = Path(args.project_dir).resolve()
@@ -389,28 +558,44 @@ def main() -> None:
 
     static_results: list[TestClassResult] = []
     org_results: list[TestClassResult] = []
+    errors: list[str] = []
 
+    try:
+        validate_class_name(class_name)
+    except ApexTestFinderError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    static_available = use_static
     if use_static:
-        print(f"[static] Scanning '{project_dir}' for test classes referencing '{class_name}'…", file=sys.stderr)
-        static_results = find_by_static_analysis(class_name, project_dir)
-        print(f"[static] Found {len(static_results)} candidate(s).", file=sys.stderr)
+        print(
+            f"[static] Scanning '{project_dir}' for test classes referencing '{class_name}'…",
+            file=sys.stderr,
+        )
+        try:
+            static_results = find_by_static_analysis(class_name, project_dir)
+            print(f"[static] Found {len(static_results)} candidate(s).", file=sys.stderr)
+        except ApexTestFinderError as exc:
+            static_available = False
+            errors.append(f"static: {exc}")
+            print(f"[static] ERROR: {exc}", file=sys.stderr)
+            if not use_org:
+                return EXIT_ERROR
 
     if use_org:
-        org_results = find_by_org_coverage(class_name, args.target_org)
-        print(f"[org]    Found {len(org_results)} coverage record(s).", file=sys.stderr)
-
-        if not org_results:
-            # No stored coverage — find test candidates via static analysis and run them
-            candidates = static_results or find_by_static_analysis(class_name, project_dir)
-            if candidates:
-                run_tests_in_org([r.name for r in candidates], args.target_org)
-                org_results = find_by_org_coverage(class_name, args.target_org)
-                print(f"[org]    Found {len(org_results)} coverage record(s) after test run.", file=sys.stderr)
-            else:
-                print(
-                    "[org]    No test candidates found by static analysis — cannot auto-run tests.",
-                    file=sys.stderr,
-                )
+        try:
+            org_results = _collect_org_results(
+                class_name, project_dir, args.target_org, static_results, static_available
+            )
+        except ApexTestFinderError as exc:
+            errors.append(f"org: {exc}")
+            print(f"[org]    ERROR: {exc}", file=sys.stderr)
+            if not use_static or not static_available:
+                return EXIT_ERROR
+            print(
+                "[org]    Continuing with static analysis results only.",
+                file=sys.stderr,
+            )
 
     if use_static and use_org:
         results = merge_results(static_results, org_results)
@@ -420,10 +605,16 @@ def main() -> None:
         results = sorted(static_results, key=lambda x: x.name.lower())
 
     if args.json:
-        print_json(class_name, results)
+        print_json(class_name, results, errors)
     else:
         print_table(class_name, results)
 
+    return EXIT_ERROR if errors else EXIT_OK
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPTED)
