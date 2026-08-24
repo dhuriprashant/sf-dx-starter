@@ -36,17 +36,17 @@ Nine classes under `force-app/main/default/classes/`, in three layers:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-| Class | File | Role |
-| --- | --- | --- |
-| `JsonApiRouter` | `JsonApiRouter.cls` | `@RestResource(urlMapping='/jsonapi/*')`. HTTP verb handlers, URL routing, header checks, body parsing, error-to-document translation. |
-| `JsonApiService` | `JsonApiService.cls` | All business logic: SOQL building, CRUD, relationships, pagination, compound documents. Fully generic — no per-object code. |
-| `JsonApiConfig` | `JsonApiConfig.cls` | The one file you edit to expose an SObject. Declares resource definitions. |
-| `JsonApiRegistry` | `JsonApiRegistry.cls` | Static in-memory map: resource type name → definition. |
-| `JsonApiResourceDefinition` | `JsonApiResourceDefinition.cls` | Fluent builder mapping JSON attribute names ↔ SObject field API names, plus relationship metadata. |
-| `JsonApiQueryParams` | `JsonApiQueryParams.cls` | Parses `include`, `fields[type]`, `sort`, `page[size]/[after]`, `filter[attr]` and validates them against the definition. |
-| `JsonApiSerializer` | `JsonApiSerializer.cls` | SObject → JSON:API resource object; assembles top-level documents and error documents. |
-| `JsonApiException` | `JsonApiException.cls` | Exception carrying HTTP status, title, and JSON:API `source` pointer/parameter. Static factories per status code. |
-| `JsonApiError` | `JsonApiError.cls` | Builds the JSON:API error-object map that gets serialized into error documents. |
+| Class                       | File                            | Role                                                                                                                                   |
+| --------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `JsonApiRouter`             | `JsonApiRouter.cls`             | `@RestResource(urlMapping='/jsonapi/*')`. HTTP verb handlers, URL routing, header checks, body parsing, error-to-document translation. |
+| `JsonApiService`            | `JsonApiService.cls`            | All business logic: SOQL building, CRUD, relationships, pagination, compound documents. Fully generic — no per-object code.            |
+| `JsonApiConfig`             | `JsonApiConfig.cls`             | The one file you edit to expose an SObject. Declares resource definitions.                                                             |
+| `JsonApiRegistry`           | `JsonApiRegistry.cls`           | Static in-memory map: resource type name → definition.                                                                                 |
+| `JsonApiResourceDefinition` | `JsonApiResourceDefinition.cls` | Fluent builder mapping JSON attribute names ↔ SObject field API names, plus relationship metadata.                                     |
+| `JsonApiQueryParams`        | `JsonApiQueryParams.cls`        | Parses `include`, `fields[type]`, `sort`, `page[size]/[after]`, `filter[attr]` and validates them against the definition.              |
+| `JsonApiSerializer`         | `JsonApiSerializer.cls`         | SObject → JSON:API resource object; assembles top-level documents and error documents.                                                 |
+| `JsonApiException`          | `JsonApiException.cls`          | Exception carrying HTTP status, title, and JSON:API `source` pointer/parameter. Static factories per status code.                      |
+| `JsonApiError`              | `JsonApiError.cls`              | Builds the JSON:API error-object map that gets serialized into error documents.                                                        |
 
 Design principle: **the engine is data-driven**. `JsonApiService` and `JsonApiSerializer` know nothing about Account or Contact; everything they do is parameterized by a `JsonApiResourceDefinition`. Adding a new resource type requires zero engine changes — only a registration in `JsonApiConfig`.
 
@@ -90,17 +90,17 @@ Apex REST allows one method per HTTP verb. Each annotated method ([JsonApiRouter
 
 `route()` ([JsonApiRouter.cls:63-117](../force-app/main/default/classes/JsonApiRouter.cls#L63-L117)) dispatches on `(method, segment count)`:
 
-| Method | Segments | Shape | Service call |
-| --- | --- | --- | --- |
-| GET | 0 | `/` | inline: meta doc listing `JsonApiRegistry.registeredTypes()` |
-| GET | 1 | `/{type}` | `listResources` |
-| GET | 2 | `/{type}/{id}` | `getResource` |
-| GET | 3 | `/{type}/{id}/{rel}` | `getRelated` |
-| GET | 4 (`seg[2]=='relationships'`) | `/{type}/{id}/relationships/{rel}` | `getRelationship` |
-| POST | 1 | `/{type}` | `createResource` → 201 + `Location` header |
-| PATCH | 2 | `/{type}/{id}` | `updateResource` |
-| PATCH | 4 (`relationships`) | `/{type}/{id}/relationships/{rel}` | `patchRelationship` |
-| DELETE | 2 | `/{type}/{id}` | `deleteResource` → 204, empty body |
+| Method | Segments                      | Shape                              | Service call                                                 |
+| ------ | ----------------------------- | ---------------------------------- | ------------------------------------------------------------ |
+| GET    | 0                             | `/`                                | inline: meta doc listing `JsonApiRegistry.registeredTypes()` |
+| GET    | 1                             | `/{type}`                          | `listResources`                                              |
+| GET    | 2                             | `/{type}/{id}`                     | `getResource`                                                |
+| GET    | 3                             | `/{type}/{id}/{rel}`               | `getRelated`                                                 |
+| GET    | 4 (`seg[2]=='relationships'`) | `/{type}/{id}/relationships/{rel}` | `getRelationship`                                            |
+| POST   | 1                             | `/{type}`                          | `createResource` → 201 + `Location` header                   |
+| PATCH  | 2                             | `/{type}/{id}`                     | `updateResource`                                             |
+| PATCH  | 4 (`relationships`)           | `/{type}/{id}/relationships/{rel}` | `patchRelationship`                                          |
+| DELETE | 2                             | `/{type}/{id}`                     | `deleteResource` → 204, empty body                           |
 
 Anything else throws `notFound` or `methodNotAllowed`. Before dispatch, `seg[0]` is resolved via `JsonApiRegistry.get()` (404 for unknown types) and query params are parsed once into a `JsonApiQueryParams` ([JsonApiRouter.cls:79-80](../force-app/main/default/classes/JsonApiRouter.cls#L79-L80)).
 
@@ -137,8 +137,8 @@ new JsonApiResourceDefinition('contacts', 'Contact')     // resourceType, sobjec
 State it holds:
 
 - `attributes` — `Map<String, String>` of JSON attribute name → SObject field API name. This map is the **whitelist**: an attribute not in it can't be read, written, sorted, or filtered.
-- `relationships` — `Map<String, Rel>` where the inner `Rel` class carries `name`, `isToMany`, `field`, `targetType`, and (for nested rels) `path`. The `field` member is overloaded by direction: for to-one it's the lookup on this SObject, for to-many it's the foreign-key lookup on the *child* SObject; for nested rels it's null.
-- **Nested rels** (`isNested()` = `path != null`) implement the spec's "expose a deeply nested relationship under an alternative name" provision. Each path segment must be a *direct* relationship on the type reached by the previous segment. Their `isToMany`/`targetType` start null and are resolved lazily on first use by `JsonApiRegistry.resolveNested()`, which walks the path through the registry (registration order in `JsonApiConfig` therefore doesn't matter): cardinality is to-many if *any* hop is to-many, and the target type is the final hop's. A broken path surfaces as a 500 Configuration Error.
+- `relationships` — `Map<String, Rel>` where the inner `Rel` class carries `name`, `isToMany`, `field`, `targetType`, and (for nested rels) `path`. The `field` member is overloaded by direction: for to-one it's the lookup on this SObject, for to-many it's the foreign-key lookup on the _child_ SObject; for nested rels it's null.
+- **Nested rels** (`isNested()` = `path != null`) implement the spec's "expose a deeply nested relationship under an alternative name" provision. Each path segment must be a _direct_ relationship on the type reached by the previous segment. Their `isToMany`/`targetType` start null and are resolved lazily on first use by `JsonApiRegistry.resolveNested()`, which walks the path through the registry (registration order in `JsonApiConfig` therefore doesn't matter): cardinality is to-many if _any_ hop is to-many, and the target type is the final hop's. A broken path surfaces as a 500 Configuration Error.
 
 Derived helpers:
 
@@ -160,14 +160,14 @@ Registration is code, not custom metadata — a deliberate trade-off: type-check
 
 `parse(req.params, def)` ([JsonApiQueryParams.cls:18-64](../force-app/main/default/classes/JsonApiQueryParams.cls#L18-L64)) walks every query-string key (Apex REST pre-decodes them, so the key literally arrives as `page[size]`) and populates:
 
-| Param | Parsed into | Validation |
-| --- | --- | --- |
-| `include=a,b.c` | `List<String> include` (raw names or dot-paths) | each dot-separated segment must be a relationship on the type reached by the previous segment (walked through the registry), else 400 with `source.parameter` |
-| `fields[TYPE]=x,y` | `Map<String, Set<String>> sparseFields` | **not validated** — unknown types/fields simply have no effect at serialization |
-| `sort=-name,createdAt` | `List<SortField>` (`attribute`, `descending`) | each attribute must resolve via `def.fieldFor()`, else 400 |
-| `page[size]` | `pageSize` (default null = no pagination) | positive integer; `page[number]` is rejected with a 400 — offset pagination is not supported |
-| `page[after]` | `after` | keyset cursor: a record Id of the target type (prefix-checked); requires `page[size]`, rejects `sort`; walk is `WHERE Id > :after ORDER BY Id ASC` — no OFFSET, unlimited depth |
-| `filter[ATTR]=v1,v2` | `Map<String, String> filters` (raw value; commas = IN) | attribute must resolve via `def.fieldFor()`, else 400 |
+| Param                  | Parsed into                                            | Validation                                                                                                                                                                      |
+| ---------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include=a,b.c`        | `List<String> include` (raw names or dot-paths)        | each dot-separated segment must be a relationship on the type reached by the previous segment (walked through the registry), else 400 with `source.parameter`                   |
+| `fields[TYPE]=x,y`     | `Map<String, Set<String>> sparseFields`                | **not validated** — unknown types/fields simply have no effect at serialization                                                                                                 |
+| `sort=-name,createdAt` | `List<SortField>` (`attribute`, `descending`)          | each attribute must resolve via `def.fieldFor()`, else 400                                                                                                                      |
+| `page[size]`           | `pageSize` (default null = no pagination)              | positive integer; `page[number]` is rejected with a 400 — offset pagination is not supported                                                                                    |
+| `page[after]`          | `after`                                                | keyset cursor: a record Id of the target type (prefix-checked); requires `page[size]`, rejects `sort`; walk is `WHERE Id > :after ORDER BY Id ASC` — no OFFSET, unlimited depth |
+| `filter[ATTR]=v1,v2`   | `Map<String, String> filters` (raw value; commas = IN) | attribute must resolve via `def.fieldFor()`, else 400                                                                                                                           |
 
 Unrecognized parameters are silently ignored. Validation happens **against the definition of the primary resource type in the URL** — this is why parsing needs the `def` and happens after type resolution in the router.
 
@@ -201,7 +201,7 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 2. No COUNT query is ever run. Paginated requests fetch `pageSize + 1` rows — the sentinel row's presence decides the `next` link — so a page costs only `pageSize + 1` of the 50k query-row governor budget regardless of collection size. Unpaginated requests fetch everything, capped with a `LIMIT` at the remaining budget; filling the cap is treated as truncation and throws a 400 "Result Set Too Large" instead of an uncatchable `LimitException` (`totalResources` is `records.size()`).
 3. With `page[after]`, `Id > :jsonApiAfter` is ANDed into the WHERE and the fallback `ORDER BY Id ASC` provides the matching order (`sort` is rejected with a cursor). `next` carries the last returned record's Id, so following links walks a collection of any size in `pageSize` steps — no OFFSET is ever used, so there is no depth limit. The walk is not a snapshot: rows inserted behind the cursor mid-walk are missed.
 4. The page query adds `buildOrderBy()` — each sort becomes `Field DESC NULLS LAST` / `ASC NULLS FIRST`, with a fallback `ORDER BY Id ASC` so pagination is stable when no sort is given — plus `LIMIT :jsonApiLimit` (`pageSize + 1`, or the row budget when unpaginated).
-5. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (`self`/`first`, plus `next` when the sentinel row was present *and* the page is unsorted — the cursor cannot resume a custom sort order, so a sorted page is always the only page; `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`pageSize` only). Unpaginated requests get only a `self` link and `totalResources`.
+5. `buildCompound()` resolves `?include` (see §5.4), then each record is serialized and wrapped in a document with `pageLinks()` (`self`/`first`, plus `next` when the sentinel row was present _and_ the page is unsorted — the cursor cannot resume a custom sort order, so a sorted page is always the only page; `page[...]` brackets percent-encoded as `%5B`/`%5D`) and `pageMeta()` (`pageSize` only). Unpaginated requests get only a `self` link and `totalResources`.
 
 ### 5.3 GET /{type}/{id} — getResource and fetchById
 
@@ -214,14 +214,14 @@ There is no string concatenation of user values into SOQL anywhere; injection su
 - `included` — the deduplicated list of serialized related resources for the top-level `included` array. The dedup `seen` set (key `type + ':' + Id`) is **seeded with the primary records**, so primary data is never duplicated in `included`, per the spec.
 - `toManyData` — `Map<relName, Map<parentId, List<identifier>>>`: the linkage the serializer needs to emit `relationships.{rel}.data` for to-many and nested relationships. Linkage from different paths merges per parent via `mergeLinkage()`.
 
-The algorithm processes each include path **level by level**: starting from the primary records, each segment is expanded by `expandRelationship()` ([JsonApiService.cls:271-309](../force-app/main/default/classes/JsonApiService.cls#L271-L309)) into the next level of records, which become both `included` entries and the parents for the following segment. Per the spec's full-linkage rule, **intermediate resources are included along with the leaf nodes** — `contacts.reportsTo` puts the contacts *and* their managers in `included`. Two mechanics make this efficient and correct:
+The algorithm processes each include path **level by level**: starting from the primary records, each segment is expanded by `expandRelationship()` ([JsonApiService.cls:271-309](../force-app/main/default/classes/JsonApiService.cls#L271-L309)) into the next level of records, which become both `included` entries and the parents for the following segment. Per the spec's full-linkage rule, **intermediate resources are included along with the leaf nodes** — `contacts.reportsTo` puts the contacts _and_ their managers in `included`. Two mechanics make this efficient and correct:
 
 - **Prefix cache**: expanded levels are memoized by path prefix, so `include=contacts,contacts.reportsTo` expands `contacts` once, not twice.
-- **Deferred serialization**: included records are collected as `(record, def)` pairs and only serialized *after* all paths are processed, with the complete `toManyData` map. That's what lets an included intermediate carry `data` linkage for the next segment (e.g. an included account's `contacts` array when the path is `account.contacts`) — full linkage, not just links.
+- **Deferred serialization**: included records are collected as `(record, def)` pairs and only serialized _after_ all paths are processed, with the complete `toManyData` map. That's what lets an included intermediate carry `data` linkage for the next segment (e.g. an included account's `contacts` array when the path is `account.contacts`) — full linkage, not just links.
 
 Per segment kind, `expandRelationship` does:
 
-- **to-many**: one bulk query — `queryChildren()` selects the child definition's fields *plus the FK field*, filters `WHERE fk IN :parentIds` — children are grouped by parent ID into `toManyData`. One query per level regardless of how many parents (no N+1).
+- **to-many**: one bulk query — `queryChildren()` selects the child definition's fields _plus the FK field_, filters `WHERE fk IN :parentIds` — children are grouped by parent ID into `toManyData`. One query per level regardless of how many parents (no N+1).
 - **to-one**: collect the non-null lookup IDs across the parents, one `queryByIds()` bulk fetch. No linkage map needed — the serializer reads the lookup value straight off the parent record.
 - **nested** (aliased path): delegated to `traverseNested()` — see §5.5. Its root→final linkage merges into `toManyData` like a to-many segment.
 
@@ -231,7 +231,7 @@ Included resources are serialized with the same `qp`, so `fields[childType]` spa
 
 Implements the spec's "expose a deeply nested relationship under an alternative name" provision (registered via `.nested()`, §3.1) — unlike a dot-path include, an alias deliberately **hides the intermediate resources**. Two helpers:
 
-- **`JsonApiRegistry.resolveNested()`** ([JsonApiRegistry.cls:33-54](../force-app/main/default/classes/JsonApiRegistry.cls#L33-L54)) — validates the path on first use and caches the result on the `Rel`: each segment must be a *direct* relationship on the type reached by the previous segment (a broken path is a 500 Configuration Error); cardinality resolves to to-many if **any** hop is to-many; `targetType` becomes the final hop's type. Lazy resolution means `JsonApiConfig` registration order doesn't matter. It lives on the registry so both the engine and query-param validation can call it.
+- **`JsonApiRegistry.resolveNested()`** ([JsonApiRegistry.cls:33-54](../force-app/main/default/classes/JsonApiRegistry.cls#L33-L54)) — validates the path on first use and caches the result on the `Rel`: each segment must be a _direct_ relationship on the type reached by the previous segment (a broken path is a 500 Configuration Error); cardinality resolves to to-many if **any** hop is to-many; `targetType` becomes the final hop's type. Lazy resolution means `JsonApiConfig` registration order doesn't matter. It lives on the registry so both the engine and query-param validation can call it.
 - **`traverseNested()`** ([JsonApiService.cls:330-395](../force-app/main/default/classes/JsonApiService.cls#L330-L395)) — walks the path hop by hop with **one bulk query per hop** (`queryChildren` for to-many hops, `queryByIds` for to-one hops), carrying a `Map<currentRecordId, Set<rootId>>` so fan-out/fan-in linkage stays correct — e.g. two contacts reporting to the same manager collapse to a single linkage entry per root account. It returns a `NestedResult`: the final-hop records, their definition, and `root → identifiers` linkage.
 
 Only the **final-hop** records are serialized into `included`/`toManyData` — intermediates are queried but never emitted, which is the point of the alias. A nested rel whose hops are all to-one serializes as to-one linkage (single identifier or null) instead of an array. Nested rels are read-only end to end: body writes are rejected in `applyToOneRelationships` (400) and `patchRelationship` refuses them (403).
@@ -284,7 +284,7 @@ Everything is built as `Map<String, Object>` / `List<Object>` and serialized onc
 
 Key mechanics:
 
-- **Sparse fieldsets**: `qp.sparseFor(def.resourceType)` returns the allowed name set (or null = everything). Both attributes *and relationships* are filtered by it, matching the spec's definition of "fields".
+- **Sparse fieldsets**: `qp.sparseFor(def.resourceType)` returns the allowed name set (or null = everything). Both attributes _and relationships_ are filtered by it, matching the spec's definition of "fields".
 - **Relationship `data`**: direct to-one linkage is always emitted (the lookup value is on the record — free). To-many and nested linkage is only emitted when the caller passed the `toManyData` map, i.e. when that rel was `?include`d; otherwise the rel object carries links only. This keeps un-included relationships from costing queries. A nested rel resolved to to-one cardinality is emitted as a single identifier (or null) rather than an array.
 - `document()` ([JsonApiSerializer.cls:82-103](../force-app/main/default/classes/JsonApiSerializer.cls#L82-L103)) wraps data with `{"jsonapi": {"version": "1.1"}}` plus optional `links` / `meta` / `included`. `errorDocument()` does the same for a list of `JsonApiError.toMap()`s.
 - `baseUrl()` uses `URL.getOrgDomainUrl()`, so all generated links are absolute against the org's My Domain.
@@ -295,8 +295,8 @@ Key mechanics:
 
 Two classes split the concern:
 
-- **`JsonApiException`** ([JsonApiException.cls](../force-app/main/default/classes/JsonApiException.cls)) is the *control-flow* type. It extends `Exception` and carries `status`, `title`, and optional `sourcePointer` / `sourceParameter`. Static factories map to statuses: `badRequest` 400, `badParameter` 400 + `source.parameter`, `forbidden` 403, `notFound` 404, `methodNotAllowed` 405, `notAcceptable` 406, `conflict` 409, `unsupportedMediaType` 415. `.withPointer('/data/attributes/x')` chains a JSON pointer to the offending body location.
-- **`JsonApiError`** ([JsonApiError.cls](../force-app/main/default/classes/JsonApiError.cls)) is the *representation*: `toMap()` emits `{status, title, detail?, code?, source?{pointer?, parameter?}}` per the spec's error-object shape.
+- **`JsonApiException`** ([JsonApiException.cls](../force-app/main/default/classes/JsonApiException.cls)) is the _control-flow_ type. It extends `Exception` and carries `status`, `title`, and optional `sourcePointer` / `sourceParameter`. Static factories map to statuses: `badRequest` 400, `badParameter` 400 + `source.parameter`, `forbidden` 403, `notFound` 404, `methodNotAllowed` 405, `notAcceptable` 406, `conflict` 409, `unsupportedMediaType` 415. `.withPointer('/data/attributes/x')` chains a JSON pointer to the offending body location.
+- **`JsonApiError`** ([JsonApiError.cls](../force-app/main/default/classes/JsonApiError.cls)) is the _representation_: `toMap()` emits `{status, title, detail?, code?, source?{pointer?, parameter?}}` per the spec's error-object shape.
 
 The router's catch chain (§2) is the only place errors become HTTP. Notably, `DmlException` → **422** with the first DML message as `detail` and the `StatusCode` enum (e.g. `REQUIRED_FIELD_MISSING`, `FIELD_CUSTOM_VALIDATION_EXCEPTION`) as `code` — so validation rules and required fields surface cleanly without any framework code knowing about them.
 
@@ -307,12 +307,14 @@ Example error document:
 ```json
 {
   "jsonapi": { "version": "1.1" },
-  "errors": [{
-    "status": "400",
-    "title": "Bad Request",
-    "detail": "Unknown attribute: nickname",
-    "source": { "pointer": "/data/attributes/nickname" }
-  }]
+  "errors": [
+    {
+      "status": "400",
+      "title": "Bad Request",
+      "detail": "Unknown attribute: nickname",
+      "source": { "pointer": "/data/attributes/nickname" }
+    }
+  ]
 }
 ```
 
@@ -323,8 +325,8 @@ Example error document:
 Defense in depth, three layers:
 
 1. **Whitelist at the definition.** Only registered resource types are routable, and only declared attributes/relationships are readable, writable, sortable, filterable, or includable. Anything else is a 400/404 before any query runs.
-2. **Injection-safe SOQL.** Field and object names in query strings come exclusively from `JsonApiConfig` registration code; every user-supplied *value* (filters, IDs, page numbers) goes through `Database.queryWithBinds` bind maps.
-3. **Platform enforcement.** `with sharing` on router and service plus `AccessLevel.USER_MODE` on every `queryWithBinds` / `countQueryWithBinds` / `insert` / `update` / `delete` means CRUD, FLS, and sharing rules of the *calling user* are enforced by the platform: unreadable fields throw, invisible records 404, forbidden DML throws (→ surfaces via the catch chain).
+2. **Injection-safe SOQL.** Field and object names in query strings come exclusively from `JsonApiConfig` registration code; every user-supplied _value_ (filters, IDs, page numbers) goes through `Database.queryWithBinds` bind maps.
+3. **Platform enforcement.** `with sharing` on router and service plus `AccessLevel.USER_MODE` on every `queryWithBinds` / `countQueryWithBinds` / `insert` / `update` / `delete` means CRUD, FLS, and sharing rules of the _calling user_ are enforced by the platform: unreadable fields throw, invisible records 404, forbidden DML throws (→ surfaces via the catch chain).
 
 Authentication is standard Salesforce OAuth — Apex REST requires a valid session/access token before the router ever runs.
 
@@ -353,7 +355,7 @@ Variant with a nested alias — `GET /accounts/{id}?include=contactManagers`: sa
 
 ## 10. Known limitations / design boundaries
 
-- **Nested aliases can't nest.** A `.nested()` path segment must be a direct relationship — an alias can't reference another alias (500 Configuration Error). Dot-path *includes* may use aliases as segments, though.
+- **Nested aliases can't nest.** A `.nested()` path segment must be a direct relationship — an alias can't reference another alias (500 Configuration Error). Dot-path _includes_ may use aliases as segments, though.
 - **No include-path depth limit.** Dot-paths of any length are accepted; each segment costs one query, so a hostile deep path costs `pathLength` queries (bounded in practice by exposed relationships and the 100-SOQL governor limit).
 - **Filters are equality/IN only** — no `filter[amount][gte]`-style operators; multiple filters always AND.
 - **Pagination is cursor-only.** `page[number]` is rejected (400); the `page[after]` keyset cursor has unlimited depth but is forward-only, Id-ordered, and not a point-in-time snapshot. Consequently a **sorted page is not walkable**: `sort` + `page[size]` returns the top page with no `next` link, because the cursor cannot resume a custom sort order.
@@ -374,4 +376,4 @@ sf project deploy start --source-dir force-app/main/default/classes
 sf apex run test --class-names JsonApiRouterTest --result-format human --wait 10
 ```
 
-Note: deploying with `--test-level RunSpecifiedTests` enforces 75% coverage *per class touched*; `JsonApiRegistry` and `JsonApiRouter` currently sit just below that, so deploy without a test level to a dev org and run the suite separately.
+Note: deploying with `--test-level RunSpecifiedTests` enforces 75% coverage _per class touched_; `JsonApiRegistry` and `JsonApiRouter` currently sit just below that, so deploy without a test level to a dev org and run the suite separately.
