@@ -30,7 +30,12 @@ npm run test:unit:watch      # Jest in watch mode
 npm run test:unit:coverage   # Jest with coverage report
 npm run prettier      # Format all source files in-place
 npm run prettier:verify      # Check formatting without writing
+
+python3 -m pytest                                  # Python unit tests (tests/)
+python3 -m pytest --cov=apex_test_finder            # with coverage report
 ```
+
+Python tests require `pytest` and `pytest-cov` (`pip install pytest pytest-cov`).
 
 **Pre-commit hook** (`husky` + `lint-staged`) automatically runs Prettier, ESLint, and Jest `--findRelatedTests` on staged files — do not skip it.
 
